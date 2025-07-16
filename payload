@@ -1,0 +1,58 @@
+{ 
+    "EOLNumber": " BKOOSTOCKTEST", 
+    "SendingSystem": "NC3", 
+    "CompanyName": "Smart Water", 
+    "ServiceRequest": " BKOOSTOCKTEST", 
+    "ServiceLine": "AVPN", 
+    "Staged": true, 
+    "OrderType": "New", 
+    "SDPRequired": false, 
+    "ConfigRequired": false, 
+    "NeedByDate": "2025-06-24", 
+    "Comments": "", 
+    "WarehouseComments": "", 
+    "MarkFor": { 
+        "CompanyName": "Smart Water", 
+        "StreetAddressLine1": "PERSIARAN LAGOON, BANDAR SUNWAY, THE PINNACLE", 
+        "StreetAddressLine2": "Floor: 5, Room: 5-01, (Site Key=91369858)", 
+        "City": "SELANGOR", 
+        "StateOrProvince": "GA", 
+        "ZipCodeOrPostalCode": "47500", 
+        "Country": "US", 
+        "ContactName": "KRISHNA RAU", 
+        "ContactPhoneNumber": "60133463204", 
+        "ContactEmail": "KRISHNARAU.RAMARAU@ROCHE.COM", 
+        "AlternateContactName": "SATISHKUMAR VELAYALHAN", 
+        "AlternateContactEmail": "SATISHKUMAR.VELAYALHAN@ROCHE.COM", 
+        "AlternateContactPhoneNumber": "60122328554", 
+        "CLLICode": "PJAYML95NA0", 
+        "SiteID": "FHROSELMY01" 
+    }, 
+    "ShipToAddress": { 
+        "CompanyName": "Smart Water", 
+        "StreetAddressLine1": "PERSIARAN LAGOON, BANDAR SUNWAY, THE PINNACLE", 
+        "StreetAddressLine2": "(Site Key=91369858)", 
+        "City": "SELANGOR", 
+        "StateOrProvince": "GA", 
+        "ZipCodeOrPostalCode": "47500", 
+        "Country": "US", 
+        "ContactName": "KRISHNA  RAU", 
+        "ContactPhoneNumber": "60133463204", 
+        "ContactEmail": "KRISHNARAU.RAMARAU@ROCHE.COM", 
+        "CLLICode": "PJAYML95NA0 ", 
+        "SiteID": "FHROSELMY01" 
+    }, 
+    "OrderSubType": "New", 
+    "LineItems": [ 
+         { 
+            "LineItemAction": "New", 
+            "SourceSystemLineItemNumber": 1, 
+            "ManufacturerPartNumber": "QSFP-H10G-CU1-5M",/CAB-ACU 
+            "Manufacturer": "CISCO SYSTEMS", 
+            "License": false, 
+            "Quantity": 1, 
+            "Ownership": "P", 
+            "ConfigurationSequenceNumber": "1.0" 
+        } 
+    ] 
+} 
