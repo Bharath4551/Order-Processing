@@ -1,0 +1,1512 @@
+var ABSPLOrderProcessing = Class.create();
+
+ABSPLOrderProcessing.prototype = {
+    initialize: function() {
+        this.error_message = '';
+        this.processing_message = '';
+        this.line_error = '';
+        this.commonUtil = new ABSPLCommonUtil();
+        this.dataUtil = new ABSPLDataUtil();
+        this.instanceStack = this.commonUtil.getInstanceStack();
+    },
+
+    // Processing validations invdividually for clean erorr details.
+    // This is executed asyncronously so response time should not be affected.
+    ProcessValidations: function(validationGR) {
+        this.Logging(validationGR, "log", "\n\nOrder Validations started -- " + new GlideDateTime() + " (GMT)");
+        this._errorReset(validationGR);
+        this.OrderValidations(validationGR);
+        this.LineItemValidations(validationGR);
+
+        this.Logging(validationGR, "log", "\n  -> Field Validations Complete");
+
+        if (this.error_message == "" && validationGR.attachment_missing == false)
+            validationGR.processing_status = "Unprocessed";
+        else if (this.error_message == "" && validationGR.attachment_missing == true)
+            validationGR.processing_status = "Pending Attachments";
+        else if (this.error_message != "")
+            validationGR.processing_status = "Error";
+
+        validationGR.error_details = this.error_message.toString().trim();
+        validationGR.processing_log += "\n\n" + this.processing_message + "";
+
+        if (this.error_message != "")
+            validationGR.processing_error = true;
+
+        validationGR.update();
+    },
+
+    OrderValidations: function(validationGR) {
+        this.EOLTypeCheck(validationGR, 'Order');
+        this.OrderTypeCheck(validationGR);
+        this.MandatoryCheck(validationGR, 'Order');
+        this.MandatoryStateForUSA(validationGR);
+        this.FieldTypeCheck(validationGR, 'Order');
+        //this.OrderAttachmentCheck(validationGR); // Moving to Order level, no longer at staging
+        this.WarehouseCheck(validationGR);
+        this.OrderStateCheck(validationGR);
+        this.ServiceLineCheck(validationGR);
+        this.GovernmentCheck(validationGR);
+
+        if (validationGR.order_type.toString().toUpperCase() != "RETURN" && validationGR.order_type.toString().toUpperCase() != "CANCEL") {
+            this.NeedByDateCheck(validationGR);
+            this.ValidateCLLI(validationGR);
+            this.LSPCountryCheck(validationGR);
+            //this.CustomerStrataCheck(validationGR);
+        }
+
+        // if (validationGR.subtype.toString().toUpperCase() == "REWORK")
+        //     this.ReworkCheck(validationGR);
+
+        if (this.error_message != "") {
+            this.error_message = 'Error/s found on Order Summary:\n  ' + this.error_message;
+            this.Logging(validationGR, "log", "\n  -> Error/s found on Order Summary (See Error Details field)");
+        }
+
+    },
+
+    LineItemValidations: function(validationGR) {
+        var lineItemGR = new GlideRecord('x_att2_abs_procure_stage_order_line_item');
+        lineItemGR.addQuery('staging_order', validationGR.sys_id + "");
+        lineItemGR.query();
+        var configSequenceNumberArray = [];
+        while (lineItemGR.next()) {
+            this.line_error = '';
+            this.EOLTypeCheck(lineItemGR, 'Line Item');
+            this.LineItemActionCheck(lineItemGR, validationGR);
+            this.MandatoryCheck(lineItemGR, 'Line Item');
+            this.FieldTypeCheck(lineItemGR, 'Line Item');
+            this.QuantityCheck(lineItemGR);
+            this.ValidateProducts(lineItemGR);
+            this.OwnershipCheck(lineItemGR);
+
+            //Check to make sure Configuration Sequence Number is not the same between line items
+            if (validationGR.order_type.toString().toUpperCase() != "RETURN") {
+                if (configSequenceNumberArray.indexOf(lineItemGR.configuration_sequence_number.toString()) == -1) {
+                    configSequenceNumberArray.push(lineItemGR.configuration_sequence_number.toString());
+                } else {
+                    this._logValidationError(lineItemGR, ABSPLAlerts.FIELD_VALUE_INVALID, "Invalid Configuration Sequence Number of " + lineItemGR.configuration_sequence_number + ". Can't have duplicate line item configuration sequence numbers on the same Order Summary");
+                }
+            }
+
+            if (this.line_error == "")
+                lineItemGR.processing_status = "Validated";
+            else {
+                this.Logging(lineItemGR, "log", "\n  -> Error found on Line Item " + lineItemGR.number);
+                lineItemGR.processing_status = 'Error';
+                lineItemGR.error_details = this.line_error + "";
+                this.error_message += "\n\nError found on Line Item " + lineItemGR.number + ":\n  " + this.line_error;
+            }
+            if (lineItemGR.product_model_invalid == true)
+                validationGR.product_model_invalid = true;
+            lineItemGR.update();
+        }
+
+    },
+
+    ApplyJSON: function(validationGR, type, payload_string) {
+        if (type == "Order")
+            this.Logging(validationGR, "log", "\n\nEOL " + type + " Payload Transform started -- " + new GlideDateTime() + " (GMT)");
+        var payload = JSON.parse(payload_string + "");
+        var missing_fields = new Array();
+        var config = new GlideRecord('x_att2_abs_procure_abspl_processing_config');
+        config.addQuery('type', type);
+        config.addQuery('active', true);
+        config.addNotNullQuery('source_json');
+        config.query();
+        while (config.next()) {
+
+            //Start of Temporary Code for Government Indicator Workaround
+            if (config.sys_id == '3c9ef9311bfa39d492676421604bcbf3') { //Government Indicator
+                validationGR.government_indicator = this._objectDotWalk(payload, config.source_json + "");
+
+                if (validationGR.government_indicator == "true")
+                    validationGR.government_indicator = "US Federal Government";
+                else if (validationGR.government_indicator == "false")
+                    validationGR.government_indicator = "Non-Government";
+                else if (validationGR.government_indicator == "") {
+                    missing_fields.push(config.source_json + "");
+                    validationGR.government_indicator = "Non-Government";
+                }
+
+                validationGR.government_indicator = validationGR.government_indicator.toString().trim(); //End of Temp Code
+            } else {
+                validationGR[config.staging_field + ""] = this._objectDotWalk(payload, config.source_json + "");
+                if (this._objectDotWalk(payload, config.source_json + "") == undefined) {
+                    missing_fields.push(config.source_json + "");
+                } else {
+                    if (config.staging_field + "" == "order_type")
+                        validationGR[config.staging_field + ""] = validationGR[config.staging_field + ""].toString().toLowerCase().trim();
+                    else if (config.staging_field + "" == "circuit_info"){
+						validationGR[config.staging_field + ""] = validationGR[config.staging_field + ""].toString().trim();
+						var circuitInfoSplit = validationGR[config.staging_field + ""].split('|');
+                        validationGR.circuit_id = circuitInfoSplit[1];
+					}
+                    else
+                        validationGR[config.staging_field + ""] = validationGR[config.staging_field + ""].toString().trim();
+
+                }
+            }
+        }
+        if (missing_fields.length > 0) {
+            this.Logging(validationGR, "log", "\n  -> Fields missing from payload for " + (validationGR.number || validationGR.source_system_line_item_number) + ":");
+            for (var i in missing_fields) {
+                this.Logging(validationGR, "log", "\n    -> " + missing_fields[i]);
+            }
+        }
+        // We only update when it's the order because we're applying the JSON to the line item before creation (async)
+        // so the line item is not created yet when we get here (.update will not work)
+        if (type == "Order") {
+            this.Logging(validationGR, "log", "\n  -> Transform Complete");
+            validationGR.update();
+        }
+    },
+
+    EOLTypeCheck: function(validationGR, type) {
+        if (type == "Order") {
+            var validOrderTypes, validOrderSubtypes, errMsg;
+
+            if (this.instanceStack == 'FEDGOV') {
+                validOrderTypes = ['NEW', 'CANCEL'];
+                validOrderSubtypes = ['NEW', 'CANCEL', 'STOCK ORDER'];
+                errMsg = 'Order type/subtype "' + validationGR.order_type + '/' + validationGR.subtype + '" not valid for GCC processing';
+            } else {
+                validOrderTypes = ['NEW', 'CANCEL', 'RETURN'];
+                validOrderSubtypes = true;
+                errMsg = 'Order type/subtype "' + validationGR.order_type + '/' + validationGR.subtype + '" not valid';
+            }
+
+            if (validOrderTypes.indexOf(validationGR.order_type.toString().toUpperCase()) < 0 || (validOrderSubtypes !== true && validOrderSubtypes.indexOf(validationGR.subtype.toString().toUpperCase()) < 0))
+                this._logValidationError(validationGR, ABSPLAlerts.ORDER_TYPE_INVALID, errMsg);
+
+        } else if (type == "Line Item") {
+            var actionObject = {
+                "NEW": "NEW",
+                "CANCEL": "CANCEL",
+                "UPDATE": "ADD,KEEP,DELETE",
+                "RETURN": "RETURN"
+            };
+            if (actionObject[validationGR.staging_order.order_type.toString().toUpperCase()].indexOf(validationGR.line_item_action.toString().toUpperCase()) == -1)
+                this._logValidationError(validationGR, ABSPLAlerts.LINE_ACTION_INVALID, 'Line item action "' + validationGR.line_item_action + '" not valid');
+
+        }
+
+    },
+
+    OrderTypeCheck: function(validationGR) {
+        if (validationGR.order_type.toString().toUpperCase() == "NEW" || validationGR.order_type.toString().toUpperCase() == "RETURN") {
+            // Make sure order doesn't already exist
+            var dupeOrderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+            dupeOrderGR.addQuery('eol_number', validationGR.eol_number + "");
+            if (validationGR.order_type.toString().toUpperCase() == "RETURN") {
+                dupeOrderGR.addQuery('order_type', 'return');
+            }
+            dupeOrderGR.query();
+            if (dupeOrderGR.next()) {
+                this._logValidationError(validationGR, ABSPLAlerts.ORDER_TYPE_INVALID, 'EOL Number ' + validationGR.eol_number + ' sent with type of ' + validationGR.order_type + ' already has a processed Order. Order Type of "Update" or "Cancel" are the only valid order types after processing.');
+            } else {
+                var dupeStageOrderGR = new GlideRecord('x_att2_abs_procure_stage_order_summary');
+                dupeStageOrderGR.addQuery('eol_number', validationGR.eol_number + "");
+                dupeStageOrderGR.addQuery('processing_status', '!=', 'Error');
+                dupeStageOrderGR.addQuery('processing_status', '!=', 'Error (Received Update)');
+                dupeStageOrderGR.addQuery('sys_id', '!=', validationGR.sys_id + "");
+                if (validationGR.order_type.toString().toUpperCase() == "RETURN") {
+                    dupeStageOrderGR.addQuery('order_type', 'Return');
+                }
+                dupeStageOrderGR.query();
+                if (dupeStageOrderGR.hasNext()) {
+                    this._logValidationError(validationGR, ABSPLAlerts.ORDER_TYPE_INVALID, 'EOL Number ' + validationGR.eol_number + ' sent with type of ' + validationGR.order_type + ' has already been sent and is processing. Order Type of "Update" or "Cancel" are the only valid order types after processing.');
+                }
+            }
+        }
+
+        if (validationGR.order_type.toString().toUpperCase() == "UPDATE" || validationGR.order_type.toString().toUpperCase() == "CANCEL") {
+            var dupeOrderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+            if (dupeOrderGR.get('eol_number', validationGR.eol_number)) {
+                if (dupeOrderGR.state + '' == 'Complete' || dupeOrderGR.state + '' == 'Cancelled')
+                    this._logValidationError(validationGR, ABSPLAlerts.ORDER_TYPE_INVALID, 'EOL Number ' + validationGR.eol_number + ' sent with type of "' + validationGR.order_type + '" not allowed after order is ' + dupeOrderGR.state);
+            } else {
+                //this.Logging(validationGR, "error", '\n  -> EOL Number ' + validationGR.eol_number + ' sent with type of "' + validationGR.order_type + '" but no matching Processed order exists to ' + validationGR.order_type);
+                this._logValidationError(validationGR, ABSPLAlerts.ORDER_TYPE_INVALID, 'EOL Number ' + validationGR.eol_number + ' sent with type of "' + validationGR.order_type + '" but no matching Processed order exists to ' + validationGR.order_type);
+            }
+        }
+    },
+
+    ReworkCheck: function(validationGR) {
+        // Get the original SR number from the comments and validate we can find it to start the rework against
+        // If not found, we reject the order
+        var originalSR = this.commonUtil.getServiceRequestFromComments(validationGR.comments + "");
+        if (originalSR == "") {
+            this._logValidationError(validationGR, ABSPLAlerts.ORDER_TYPE_INVALID, 'EOL Number ' + validationGR.eol_number + ' sent with Sub type of "' + validationGR.subtype + '" but no matching Original SR of "' + originalSR + '" order exists to ' + validationGR.subtype);
+        } else {
+            var serviceRequestGR = new GlideRecord('x_att2_abs_procure_service_request');
+            if (!serviceRequestGR.get('service_request', originalSR)) {
+                this._logValidationError(validationGR, ABSPLAlerts.ORDER_TYPE_INVALID, 'EOL Number ' + validationGR.eol_number + ' sent with Sub type of "' + validationGR.subtype + '" but no matching Original SR of "' + originalSR + '" order exists to ' + validationGR.subtype);
+            }
+        }
+    },
+
+    LineItemActionCheck: function(lineItemGR, orderGR) {
+        if (lineItemGR.line_item_action.toString().toUpperCase() == "KEEP" || lineItemGR.line_item_action.toString().toUpperCase() == "DELETE" || lineItemGR.line_item_action.toString().toUpperCase() == "CANCEL" || lineItemGR.line_item_action.toString().toUpperCase() == "ADD") {
+            var matchingOrderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+            if (matchingOrderGR.get('eol_number', orderGR.eol_number)) {
+                var dupeLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_line_item');
+                dupeLineGR.addQuery('source_system_line_item_number', lineItemGR.source_system_line_item_number + "");
+                dupeLineGR.addQuery('order', matchingOrderGR.sys_id + "");
+                dupeLineGR.query();
+                if ((lineItemGR.line_item_action.toString().toUpperCase() == "ADD" || lineItemGR.line_item_action.toString().toUpperCase() == "RETURN") && dupeLineGR.hasNext()) {
+                    this._logValidationError(lineItemGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'Line Item Number ' + lineItemGR.source_system_line_item_number + ' sent with type of "' + lineItemGR.line_item_action + '" but a matching Processed Line Item already exists.');
+                    //this.Logging(lineItemGR, "error", '\n  -> Line Item Number ' + lineItemGR.source_system_line_item_number + ' sent with type of "' + lineItemGR.line_item_action + '" but a matching Processed Line Item already exists.');
+                } else if ((lineItemGR.line_item_action.toString().toUpperCase() != "ADD" || lineItemGR.line_item_action.toString().toUpperCase() == "RETURN") && !dupeLineGR.hasNext()) {
+                    this._logValidationError(lineItemGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'Line Item Number ' + lineItemGR.source_system_line_item_number + ' sent with type of "' + lineItemGR.line_item_action + '" but no matching Processed Line Item exists to ' + lineItemGR.line_item_action);
+                    //this.Logging(lineItemGR, "error", '\n  -> Line Item Number ' + lineItemGR.source_system_line_item_number + ' sent with type of "' + lineItemGR.line_item_action + '" but no matching Processed Line Item exists to ' + lineItemGR.line_item_action);
+                }
+            }
+        }
+    },
+
+    OrderAttachmentCheck: function(validationGR) {
+        var needs_attachment = false;
+        var processing_log = '';
+        if (validationGR.sdp_not_required == "false") {
+            needs_attachment = true;
+            processing_log += '\n  -> SDP is required. Missing PPTX file required for processing. Attachment check runs every 12 hours to check back on this.';
+        }
+        if (validationGR.config_not_required == "false") {
+            needs_attachment = true;
+            processing_log += '\n  -> Configuration is required. Missing TXT file required for processing. Attachment check runs every 12 hours to check back on this.';
+        }
+        if (needs_attachment) {
+            validationGR.attachment_missing = true;
+            this.Logging(validationGR, 'log', processing_log);
+        }
+    },
+
+    MandatoryCheck: function(validationGR, type) {
+        var error_found = false,
+            error_fields = [];
+
+        var config = new GlideRecord('x_att2_abs_procure_abspl_processing_config');
+        config.addQuery('type', type);
+        config.addQuery('active', true);
+        config.addEncodedQuery('mandatory_for_order_typeLIKE' + validationGR.order_type);
+        config.query();
+        while (config.next()) {
+            if (validationGR[config.staging_field + ""].nil()) {
+                if (!error_found)
+                    error_found = true;
+
+                error_fields.push(config.source_json + " [" + config.staging_field + "]");
+            }
+        }
+
+        if (error_found) {
+            // Apply error type
+            if (type == "Order")
+                validationGR.mandatory_field_missing = true;
+
+            this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_MISSING, error_fields.join(','));
+        }
+    },
+
+    MandatoryStateForUSA: function(validationGR) {
+        var country_lookup = validationGR.mark_for_country + "";
+        var countryLookupGR = new GlideRecord('x_att2_abs_procure_country_codes');
+        countryLookupGR.addEncodedQuery('country=' + country_lookup + '^ORcode=' + country_lookup + '^ORlmc_code=' + country_lookup + '^ORlmc_country=' + country_lookup);
+        countryLookupGR.query();
+        if (countryLookupGR.next()) {
+            country_lookup = countryLookupGR.lmc_code + "";
+        }
+        var countryUtil = new ABSPLCountries();
+        var countryObj = countryUtil.GetCountriesObj();
+        for (var i in countryObj.countries) {
+            if (countryObj.countries[i]['name'] == country_lookup ||
+                countryObj.countries[i]['iso3166_3'] == country_lookup ||
+                countryObj.countries[i]['iso3166_2'] == country_lookup) {
+                if (countryObj.countries[i]['sys_id'] == "dd38b7111b121100763d91eebc0713f5") { // United States of America
+                    if (validationGR.mark_for_state_or_province.nil()) {
+                        this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_MISSING, 'Mark For "StateOrProvince" is required for United States orders.');
+                    }
+                }
+            }
+        }
+    },
+
+    FieldTypeCheck: function(validationGR, type) {
+        var numericPattern = /^[0-9]*$/;
+        var floatPattern = /^[1-9]\d*(\.\d+)?$/;
+        var errorHeader = 'The following do not match the expected type: ';
+        var errorFound = false;
+        var errorFields = [];
+        var config = new GlideRecord('x_att2_abs_procure_abspl_processing_config');
+        config.addQuery('type', type);
+        config.addQuery('active', true);
+        config.addQuery('target_field_type', 'IN', 'Boolean,Currency,Date,Integer,Reference,Float');
+        config.query();
+        while (config.next()) {
+            if (!validationGR[config.staging_field + ""].nil()) {
+                var validate = true;
+                if (config.target_field_type == "Boolean" && validationGR[config.staging_field + ""] != "true" && validationGR[config.staging_field] != "false") {
+                    validate = false;
+                } else if (config.target_field_type == "Integer" && !numericPattern.test(validationGR[config.staging_field + ""] + "")) {
+                    validate = false;
+                } else if (config.target_field_type == "Float" && !floatPattern.test(validationGR[config.staging_field + ""] + "")) {
+                    validate = false;
+                } else if (config.target_field_type == "Date" && !this._isValidDate(validationGR[config.staging_field + ""] + "")) {
+                    validate = false;
+                }
+
+                if (!validate) {
+                    errorFound = true;
+                    errorFields.push(config.source_json + " [" + config.staging_field + "](" + validationGR[config.staging_field] + ' not type ' + config.target_field_type + ')');
+                }
+            }
+        }
+
+        if (errorFound)
+            this._logValidationError(validationGR, ABSPLAlerts.FIELD_TYPE_INVALID, errorHeader + errorFields.join(','));
+    },
+
+    ValidateProducts: function(validationGR) {
+        var manufacturerName = validationGR.manufacturer + '';
+
+        var cdsMapping = new GlideRecord('cds_client_mapping');
+        cdsMapping.addQuery('discovered_name', manufacturerName);
+        cdsMapping.query();
+
+        if (cdsMapping.next()) {
+            var company = new GlideRecord('core_company');
+            company.addQuery('hash', cdsMapping.canonical_name.hash + '');
+            company.addQuery('canonical', true);
+            company.query();
+
+            if (company.next()) {
+                manufacturerName = company.name + '';
+                validationGR.normalized_manufacturer = manufacturerName;
+            }
+        }
+
+        var modelGR = new GlideRecord('cmdb_model');
+        modelGR.addEncodedQuery('model_number=' + validationGR.manufacturer_part_number + '^manufacturer.name=' + manufacturerName + '^status=In Production');
+        modelGR.query();
+        var found = false;
+        var software = false;
+        if (modelGR.getRowCount() > 1) {
+            // multiple model's found logging
+            this.Logging(validationGR, "log", "\n  -> Multiple Models Found on " + validationGR.number + ". \n        -> Picked one of the options from this list: https://" + gs.getProperty('instance_name') + ".service-now.com/cmdb_model_list.do?sysparm_query=" + modelGR.getEncodedQuery());
+        }
+        if (modelGR.next()) {
+            if (modelGR.sys_class_name == 'cmdb_software_product_model') {
+                software = true;
+            } else {
+                // set model
+                validationGR.model = modelGR.sys_id + "";
+                found = true;
+            }
+        }
+
+        if (software) {
+            var software_model = new GlideRecord('cmdb_software_product_model');
+            software_model.addEncodedQuery('model_number=' + validationGR.manufacturer_part_number + '^manufacturer.name=' + manufacturerName + '^status=In Production^edition=ABSPL');
+            software_model.query();
+            if (software_model.getRowCount() > 1) {
+                // multiple model's found logging
+                this.Logging(validationGR, "log", "\n  -> Multiple Models Found on " + validationGR.number + ". \n        -> Picked one of the options from this list: https://" + gs.getProperty('instance_name') + ".service-now.com/cmdb_model_list.do?sysparm_query=" + modelGR.getEncodedQuery());
+            }
+            if (software_model.next()) {
+                // set model
+                validationGR.model = software_model.sys_id + "";
+                found = true;
+            }
+        }
+
+
+        if (!found) {
+            //check if not in production or actually missing
+            modelGR = new GlideRecord('cmdb_model');
+            modelGR.addEncodedQuery('model_number=' + validationGR.manufacturer_part_number + '^manufacturer.name=' + manufacturerName + '^status!=In Production');
+            modelGR.query();
+
+            if (modelGR.hasNext()) {
+                // error - no model in production status found
+                validationGR.product_model_invalid = true;
+                this._logValidationError(validationGR, ABSPLAlerts.MODEL_NOT_IN_PROD_STATUS, 'No model with part number ' + validationGR.manufacturer_part_number + ' and manufacturer ' + validationGR.manufacturer + ' found in Production status.');
+            } else {
+                // error - no model found
+                validationGR.product_model_invalid = true;
+                this._logValidationError(validationGR, ABSPLAlerts.MODEL_NOT_FOUND, 'No model with part number ' + validationGR.manufacturer_part_number + ' and manufacturer ' + validationGR.manufacturer);
+            }
+        }
+    },
+
+    OwnershipCheck: function(validationGR) {
+        var ownership = validationGR.ownership + '';
+
+        var validOwnershipArray = [
+            'AT&T Supplied, AT&T Leased',
+            'Customer Supplied',
+            'AT&T Supplied, AT&T Owned',
+            'AT&T Supplied, Customer Purchased',
+            'Vendor Owned',
+            'A',
+            'C',
+            'P',
+            'R',
+            'V'
+        ];
+
+        var validOwnership = (validOwnershipArray.indexOf(ownership) >= 0);
+
+        if (!validOwnership)
+            this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'Invalid Ownership value of ' + ownership + '.');
+        else
+            validationGR.ownership = setOwnership(ownership);
+
+        function setOwnership(ownership) {
+            switch (ownership) {
+                case 'AT&T Supplied, AT&T Leased':
+                    return 'A';
+                case 'Customer Supplied':
+                    return 'C';
+                case 'AT&T Supplied, AT&T Owned':
+                    return 'P';
+                case 'AT&T Supplied, Customer Purchased':
+                    return 'R';
+                case 'Vendor Owned':
+                    return 'V';
+                default:
+                    return ownership;
+            }
+        }
+
+    },
+
+    QuantityCheck: function(validationGR) {
+        if (parseInt(validationGR.quantity) < 1) {
+            this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'Invalid Quantity of ' + validationGR.quantity + '. Quantity must be an integer value greater than 0');
+        }
+        if (validationGR.quantity.toString().indexOf('.') != -1) {
+            this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, "Invalid Quantity of " + validationGR.quantity + ". Quantity must be a whole number.");
+        }
+    },
+
+    NeedByDateCheck: function(validationGR) {
+        if (!this._isValidDate(validationGR.need_by_date)) {
+            this._logValidationError(validationGR, ABSPLAlerts.DATE_FORMAT_INVALID, 'Need By Date is not in a valid format');
+        } else {
+            var datePattern = this._getDatePattern(validationGR.need_by_date + '');
+            var dateSplit = validationGR.need_by_date.split(datePattern.dl);
+            var needByDate = dateSplit[datePattern.y] + "-" + dateSplit[datePattern.m] + "-" + dateSplit[datePattern.d];
+            var needByDateGD = new GlideDate();
+            needByDateGD.setValue(needByDate);
+
+            var todaysDate = new GlideDate();
+
+            if (!needByDateGD.after(todaysDate)) {
+                this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, "Need By Date " + validationGR.need_by_date + " is not in the future");
+                return;
+            }
+
+            //Set Date 7 Days from current day
+            var sevenDaysAfterTodaysDate = new GlideDate();
+            sevenDaysAfterTodaysDate.addDaysUTC(6);
+
+            //Set Date 30 Days from current day
+            var thirtyDaysAfterTodaysDate = new GlideDate();
+            thirtyDaysAfterTodaysDate.addDaysUTC(29);
+
+            if (needByDateGD.after(thirtyDaysAfterTodaysDate))
+                validationGR.priority = 3; //Low Priority
+            else if (needByDateGD.after(sevenDaysAfterTodaysDate))
+                validationGR.priority = 2; //Medium Priority
+            else {
+                validationGR.priority = 1; //High Priority
+            }
+        }
+    },
+
+    WarehouseCheck: function(validationGR) {
+        if (validationGR.order_type.toString().toUpperCase() != "CANCEL") {
+            var staged = validationGR.staged.toLowerCase();
+            var emptyFieldsArray = [];
+
+            //Warehouse CLLI Codes
+            var validWarehouseArray = ['BUFRGAUIA00', 'NTDBGE01A00', 'GRGNIIGBA00'];
+            if (validWarehouseArray.indexOf(validationGR.ship_to_clli_code + '') == -1)
+                warehouseValid = false;
+            else
+                warehouseValid = true;
+
+            if (!validationGR.alternate_ship_to_country.nil() && validationGR.alternate_ship_to_country != validationGR.mark_for_country) {
+                this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'Mark For and Alternate Ship To countries must match.');
+            }
+            if (staged == 'false') {
+                if (warehouseValid)
+                    this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'On orders which are not staged, Ship To address cannot be a warehouse.');
+
+                if (validationGR.order_type.toString().toUpperCase() != "RETURN") {
+                    if (!validationGR.ship_to_country.nil() && validationGR.ship_to_country != validationGR.mark_for_country) {
+                        this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'On orders which are not staged, Mark For and Ship To countries must match.');
+                    }
+                }
+            }
+
+            if (staged == 'true') {
+                //if (!warehouseValid)
+                //    this.Logging(validationGR, "error", "\n  -> On staged orders, Ship To address must be a warehouse.");
+
+                var fieldsToCheckArray = [
+                    validationGR.ship_to_street_address_line_1,
+                    validationGR.ship_to_city,
+                    validationGR.ship_to_zip_code_or_postal_code,
+                    validationGR.ship_to_country
+                ];
+
+                if (validationGR.ship_to_clli_code == "BUFRGAUIA00") {
+                    fieldsToCheckArray.push(validationGR.ship_to_state_or_province);
+                }
+
+                for (var indexFields = 0; indexFields < fieldsToCheckArray.length; indexFields++) {
+                    if (fieldsToCheckArray[indexFields] == "")
+                        emptyFieldsArray.push(fieldsToCheckArray[indexFields].getLabel());
+                }
+                if (emptyFieldsArray.length > 0) {
+                    //this.Logging(validationGR, "error", "\n  -> On Staged orders, the Ship To fields are mandatory: " + emptyFieldsArray);
+                    var country = validationGR.mark_for_country + "";
+                    if (!validationGR.alternate_ship_to_country.nil())
+                        country = validationGR.alternate_ship_to_country + "";
+
+                    // Reservation rule lookup
+                    var ruleGR = new GlideRecord('x_att2_abs_procure_reservation_rule');
+                    ruleGR.addActiveQuery();
+                    ruleGR.addQuery('service_line', validationGR.service_line + "");
+                    ruleGR.addEncodedQuery('effective_dateRELATIVELT@minute@ago@0^warehouse.countryLIKE' + country); // Effective date is in the past
+                    ruleGR.orderByDesc('effective_date');
+                    ruleGR.query();
+                    if (ruleGR.next()) {
+                        validationGR.ship_to_street_address_line_1 = 'STAGED';
+                        validationGR.ship_to_street_address_line_2 = 'STAGED';
+                        validationGR.ship_to_city = 'STAGED';
+                        validationGR.ship_to_state_or_province = 'STAGED';
+                        validationGR.ship_to_zip_code_or_postal_code = 'STAGED';
+                        validationGR.ship_to_country = ruleGR.warehouse.location.country;
+                        validationGR.ship_to_contact_name = ruleGR.warehouse.contact_name;
+                        validationGR.ship_to_contact_phone_number = ruleGR.warehouse.contact_phone;
+                    }
+                }
+            }
+        }
+    },
+
+    OrderStateCheck: function(validationGR) {
+        //Do not process an Update or Cancel if the order state is Closed OR if the order state is Open and the substate is Installed
+        if (validationGR.order_type.toString().toUpperCase() == "UPDATE" || validationGR.order_type.toString().toUpperCase() == "CANCEL") {
+            var orderSummaryGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+            orderSummaryGR.addQuery('eol_number', validationGR.eol_number + "");
+            orderSummaryGR.query();
+            if (orderSummaryGR.next()) {
+                if (orderSummaryGR.state == 'Closed') {
+                    validationGR.processing_status = "Error";
+                    //this.Logging(validationGR, "error", "\n  -> Invalid " + validationGR.order_type.toString().toUpperCase() + ". The order state is Closed.");
+                    this._logValidationError(validationGR, ABSPLAlerts.ORDER_TYPE_INVALID, "Invalid " + validationGR.order_type.toString().toUpperCase() + " - order state is Closed.");
+                }
+                if (orderSummaryGR.state == 'Open' && orderSummaryGR.substate == 'Installed') {
+                    validationGR.processing_status = "Error";
+                    //this.Logging(validationGR, "error", "\n  -> Invalid " + validationGR.order_type.toString().toUpperCase() + ". This could not process because the order state is Open and substate is Installed.");
+                    this._logValidationError(validationGR, ABSPLAlerts.ORDER_TYPE_INVALID, "Invalid " + validationGR.order_type.toString().toUpperCase() + " - order state is Open and substate is Installed.");
+                }
+                if (orderSummaryGR.state == "Shipped") {
+                    //this.Logging(validationGR, "error", '\n  -> Invalid ' + validationGR.order_type.toString().toUpperCase() + '. EOL Number ' + validationGR.eol_number + ' sent with type of "' + validationGR.order_type + '" but the Order has already been shipped and cannot be updated or cancelled at this point.');
+                    if (validationGR.order_type.toString().toUpperCase() == "UPDATE") {
+                        this._logValidationError(validationGR, ABSPLAlerts.ORDER_TYPE_INVALID, "Invalid " + validationGR.order_type.toString().toUpperCase() + " - order has already shipped.");
+                    } else {
+                        var orgStageOrder = new GlideRecord('x_att2_abs_procure_stage_order_summary');
+                        orgStageOrder.addEncodedQuery('processing_status=Processed^order_type=New^eol_number=' + orderSummaryGR.eol_number + '');
+                        orgStageOrder.query();
+
+                        if (orgStageOrder.next()) {
+                            var modifiedPayload = JSON.parse(orgStageOrder.payload);
+                            //modifiedPayload.EOLNumber += '-RL';
+                            modifiedPayload.OrderType = 'Return';
+                            modifiedPayload.OrderSubType = 'Cancel';
+
+                            for (var i = 0; i < modifiedPayload.LineItems.length; i++) {
+                                modifiedPayload.LineItems[i].LineItemAction = 'Return';
+                            }
+
+                            var stageOrder = new GlideRecord('x_att2_abs_procure_stage_order_summary');
+                            stageOrder.initialize();
+                            stageOrder.payload = JSON.stringify(modifiedPayload);
+                            stageOrder.eol_number = modifiedPayload.EOLNumber;
+                            stageOrder.order_type = modifiedPayload.OrderType;
+                            stageOrder.subtype = modifiedPayload.OrderSubType;
+                            stageOrder.processing_status = 'Inserted';
+                            stageOrder.processing_log = "EOL Payload Received -- Cancel during Shipping -- " + new GlideDateTime() + " (GMT)";
+                            stageOrder.insert();
+                        }
+                    }
+                }
+            }
+        }
+    },
+
+    ServiceLineCheck: function(validationGR) {
+        var serviceLine = new GlideRecord('x_att2_abs_procure_service_line');
+        serviceLine.addQuery('name', validationGR.service_line + '');
+        serviceLine.addActiveQuery();
+        serviceLine.query();
+        if (!serviceLine.hasNext()) {
+            validationGR.processing_status = "Error";
+            //this.Logging(validationGR, "error", "\n  -> Invalid service line '" + validationGR.service_line + "'. This could not process - cannot find any matching active Service Lines in ServiceNow.");
+            this._logValidationError(validationGR, ABSPLAlerts.SERVICE_LINE_NOT_FOUND, 'No active service line for ' + validationGR.service_line);
+        }
+    },
+
+    CustomerStrataCheck: function(validationGR) {
+        var cs = validationGR.customer_strata + '';
+        var csInt = parseInt(cs, 10);
+        if (cs < 0 || cs > 8 || isNaN(cs)) {
+            this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'Customer Strata "' + cs + '" is not a valid customer strata. Valid customer strata types include are between 0 and 8');
+        }
+    },
+
+    GovernmentCheck: function(validationGR) {
+        var governmentType = validationGR.government_indicator + '';
+        var governmentTypeArray = ['Non-Government', 'US Federal Government', 'US State Government', 'US Local Government', 'Non-US Government'];
+
+        if (governmentTypeArray.indexOf(governmentType) == -1) {
+            validationGR.processing_status = "Error";
+            //this.Logging(validationGR, "error", "\n  -> Invalid Government Type '" + governmentType + "'. This could not process.");
+            this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'Government Type "' + governmentType + '" is not a valid government type. Valid government types include "' + governmentTypeArray.join(', ') + '"');
+        }
+
+        if (this.instanceStack == 'FEDGOV') {
+            if (validationGR.mark_for_country && !validationGR.mark_for_country.nil() && !this.commonUtil.isUSTerritory(validationGR.mark_for_country))
+                this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'Mark For country must be US or US territory');
+            if (validationGR.ship_to_country && !validationGR.ship_to_country.nil() && !this.commonUtil.isUSTerritory(validationGR.ship_to_country))
+                this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, 'Ship To country must be US or US territory');
+        }
+    },
+
+    LSPCountryCheck: function(validationGR) {
+        var country_lookup = validationGR.mark_for_country + "";
+        var country_name = validationGR.mark_for_country + "";
+        var countryLookupGR = new GlideRecord('core_country');
+        countryLookupGR.addNotNullQuery('iso3166_2');
+        countryLookupGR.addQuery('sys_created_by', 'admin');
+        countryLookupGR.addEncodedQuery('name=' + country_lookup + '^ORiso3166_3=' + country_lookup + '^ORiso3166_2=' + country_lookup);
+        countryLookupGR.query();
+        if (countryLookupGR.next()) {
+            var country_id = countryLookupGR.sys_id + "";
+            var countryStates = ["AS", "FM", "GU", "MP", "PR", "VI"];
+            if (country_id == "dd38b7111b121100763d91eebc0713f5" && countryStates.indexOf(validationGR.mark_for_state_or_province + "") != -1) { // United States
+                if (validationGR.mark_for_state_or_province == "AS") {
+                    country_id = 'd138b7111b121100763d91eebc0713f7'; // American Samoa
+                    country_name = "American Samoa";
+                } else if (validationGR.mark_for_state_or_province == "FM") {
+                    country_id = '9d38b7111b121100763d91eebc0713f6'; // Micronesia (Fed. States of)
+                    country_name = 'Micronesia (Fed. States of)';
+                } else if (validationGR.mark_for_state_or_province == "GU") {
+                    country_id = 'd938b7111b121100763d91eebc0713f6'; // Guam
+                    country_name = 'Guam';
+                } else if (validationGR.mark_for_state_or_province == "MP") {
+                    country_id = '1138b7111b121100763d91eebc0713f7'; // Northern Mariana Islands
+                    country_name = 'Northern Mariana Islands';
+                } else if (validationGR.mark_for_state_or_province == "PR") {
+                    country_id = '8938b7111b121100763d91eebc0713f3'; // Puerto Rico
+                    country_name = 'Puerto Rico';
+                } else if (validationGR.mark_for_state_or_province == "VI") {
+                    country_id = '5138b7111b121100763d91eebc0713f4'; // United States Virgin Islands
+                    country_name = 'United States Virgin Islands';
+                }
+            }
+            var receivingRulesGR = new GlideRecord('x_att2_abs_procure_receiving_rules');
+            if (receivingRulesGR.get('country', country_id)) {
+                if (validationGR.order_type.toString().toUpperCase() != "NEW" && receivingRulesGR.forward_logistics_process == "No Presence") {
+                    this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, "Mark For country of " + country_name + " is an LSP country and ABSPL cannot accept orders for it.");
+                } else if (validationGR.order_type.toString().toUpperCase() != "RETURN" && receivingRulesGR.equipment_retrieval_process == "No Presence") {
+                    this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, "Mark For country of " + country_name + " is an LSP country and ABSPL cannot accept orders for it.");
+                }
+            } else {
+                this._logValidationError(validationGR, ABSPLAlerts.FIELD_VALUE_INVALID, "No receiving rule found for Mark For country of " + country_name + ". If this is not an LSP country, receiving rules must be configured before ABSPL can accept orders for it.");
+            }
+        }
+    },
+
+    ValidateCLLI: function(validationGR) {
+        // This method uses a sysId for the 'x_att2_abs_procure_stage_order_summary' table. The method starts by Collecting all 3 CLLI codes on the record.
+        //All the codes are then ran through the soap message to check for validity. If any are invalid the fields CLLI Invalid and Processing Error are set to true. An error message is also inserted into the error details field
+        //If all codes are valid the CLLI Invalid field is set to false;
+
+        var US_VALS = ['US', 'USA', 'United States', 'United States of America'];
+        var hasError = false;
+        var codes = {};
+        codes.mark_for = {
+            clli: validationGR.mark_for_clli_code + "",
+            address1: validationGR.mark_for_street_address_line_1 + "",
+            address2: validationGR.mark_for_street_address_line_2 + "",
+            city: validationGR.mark_for_city + "",
+            state: validationGR.mark_for_state_or_province + "",
+            zip: validationGR.mark_for_zip_code_or_postal_code + "",
+            country: validationGR.mark_for_country + "",
+            isUSAddress: US_VALS.some(function(usVal) {
+                return validationGR.mark_for_country.toString().toUpperCase() === usVal.toUpperCase();
+            }),
+            label: 'Mark For'
+        };
+        codes.ship_to = {
+            clli: validationGR.ship_to_clli_code + "",
+            address1: validationGR.ship_to_street_address_line_1 + "",
+            address2: validationGR.ship_to_street_address_line_2 + "",
+            city: validationGR.ship_to_city + "",
+            state: validationGR.ship_to_state_or_province + "",
+            zip: validationGR.ship_to_zip_code_or_postal_code + "",
+            country: validationGR.ship_to_country + "",
+            isUSAddress: US_VALS.some(function(usVal) {
+                return validationGR.ship_to_country.toString().toUpperCase() === usVal.toUpperCase();
+            }),
+            label: 'Ship To'
+        };
+        codes.alternate_ship_to = {
+            clli: validationGR.alternate_ship_to_clli_code + "",
+            address1: validationGR.alternate_ship_to_street_address_line_1 + "",
+            address2: validationGR.alternate_ship_to_street_address_line_2 + "",
+            city: validationGR.alternate_ship_to_city + "",
+            state: validationGR.alternate_ship_to_state_or_province + "",
+            zip: validationGR.alternate_ship_to_zip_code_or_postal_code + "",
+            country: validationGR.alternate_ship_to_country + "",
+            isUSAddress: US_VALS.some(function(usVal) {
+                return validationGR.alternate_ship_to_country.toString().toUpperCase() === usVal.toUpperCase();
+            }),
+            label: 'Alternate Ship To'
+        };
+        var field_error = '';
+        var codeArray = Object.keys(codes);
+        for (var i = 0; i < codeArray.length; i++) {
+            field_error = '';
+            field_log = '';
+            if (codes[codeArray[i]].clli != "") {
+                try {
+                    var s = new sn_ws.SOAPMessageV2('x_att2_abs_procure.LMC', 'GET Details');
+
+                    s.setStringParameterNoEscape('clli_code', codes[codeArray[i]].clli);
+                    var response = s.execute();
+                    var responseBody = response.getBody();
+                    var responsestatus = response.getStatusCode();
+
+                    if (responsestatus != "200") {
+                        //this.processing_message += "\n  -> LMC ENDPOINT NOT AVAILABLE. Cannot validate CLLI information.";
+                        this.Logging(validationGR, "log", "LMC ENDPOINT NOT AVAILABLE. Cannot validate CLLI information");
+                    } else {
+                        var xmlDoc = new XMLDocument2();
+                        xmlDoc.setNamespaceAware(true);
+                        xmlDoc.parseXML(responseBody);
+
+                        var resultCode = xmlDoc.getNodeText("//ns1:ResultCode");
+                        // result codes are 0 for success and 100 for an error; the code does not return data;
+                        if (resultCode != "0") {
+                            hasError = true;
+                            this.Logging(validationGR, 'log', '\n  -> ' + codes[codeArray[i]].label + ' CLLI code "' + codes[codeArray[i]].clli + '" not found in LMC');
+                            //this._logValidationError(validationGR, ABSPLAlerts.CLLI_CODE_INVALID, codes[codeArray[i]].label + ' CLLI code "' + codes[codeArray[i]].clli + '" not found in LMC');
+                        }
+
+                        // Optional code to give errors on address as well as availability
+                        else {
+                            var xmlDoc = new XMLDocument2();
+                            xmlDoc.setNamespaceAware(true);
+                            xmlDoc.parseXML(responseBody);
+
+                            var city = '';
+                            var state = '';
+                            var zip = '';
+                            var country = '';
+                            if (xmlDoc.getNodeText("//ns1:addressCity"))
+                                city = xmlDoc.getNodeText("//ns1:addressCity").trim() || '';
+                            if (xmlDoc.getNodeText("//ns1:addressState"))
+                                state = xmlDoc.getNodeText("//ns1:addressState").trim() || '';
+                            if (xmlDoc.getNodeText("//ns1:addressZipCode"))
+                                zip = xmlDoc.getNodeText("//ns1:addressZipCode").trim() || '';
+                            if (xmlDoc.getNodeText("//ns1:addressCountry"))
+                                country = xmlDoc.getNodeText("//ns1:addressCountry").trim() || '';
+
+                            /* Example of what I'm looping through for street addresses
+                            <ns1:streetAddress>
+                            	<ns1:sequenceNum>1</ns1:sequenceNum>
+                            	<ns1:formatIndicator>
+                            		<ns1:segAddresses>
+                            			<ns1:segAddress1>
+                            				<ns1:streetNum>2000</ns1:streetNum>
+                            				<ns1:streetName>BUFORD MILL</ns1:streetName>
+                            				<ns1:streetType>DR</ns1:streetType>
+                            			</ns1:segAddress1>
+                            			<ns1:segAddress2>
+                            				<ns1:streetName>(BLDG 100)</ns1:streetName>
+                            			</ns1:segAddress2>
+                            		</ns1:segAddresses>
+                            	</ns1:formatIndicator>
+                            </ns1:streetAddress>
+                            */
+
+                            var segregatedAddress = 'Y';
+                            if (global.JSUtil.notNil(xmlDoc.getNodeText("//ns1:useNonSegAddr"))) {
+                                if (xmlDoc.getNodeText("//ns1:useNonSegAddr") == 'Y')
+                                    segregatedAddress = 'N';
+                            }
+
+                            var streetAddress1 = '';
+
+                            if (segregatedAddress == 'N') {
+                                streetAddress1 = xmlDoc.getNodeText("//ns1:nonSegmentedAddr").trim() || '';
+                            } else {
+                                var segAddress1 = xmlDoc.getNode("//ns1:segAddress1");
+                                if (this._xmlNodeExist(segAddress1, "ns1:segAddress1")) {
+                                    var iter = segAddress1.getChildNodeIterator();
+                                    while (iter.hasNext()) {
+                                        var n = iter.next();
+                                        streetAddress1 += " " + n.getTextContent().trim();
+                                    }
+                                }
+                            }
+                            streetAddress1 = streetAddress1.trim();
+
+                            var streetAddress2 = '';
+
+                            if (segregatedAddress == 'N') {
+                                //do nothing there is no streetaddress2
+                            } else {
+                                var segAddress2 = xmlDoc.getNode("//ns1:segAddress2");
+                                if (this._xmlNodeExist(segAddress2, "ns1:segAddress2")) {
+                                    var iter = segAddress2.getChildNodeIterator();
+                                    while (iter.hasNext()) {
+                                        var n = iter.next();
+                                        streetAddress2 += " " + n.getTextContent();
+                                    }
+                                }
+                                streetAddress2 = streetAddress2.trim();
+                            }
+
+                            if (codes[codeArray[i]].label == 'Mark For') {
+                                var locationObj = {
+                                    'streetAddress1': streetAddress1,
+                                    'city': city,
+                                    'state': state,
+                                    'zip': zip,
+                                    'country': country,
+                                    'clli': codes[codeArray[i]].clli
+                                };
+
+                                validationGR.mark_for_location = this.dataUtil.getLocation(locationObj);
+                            }
+
+                            if (codes[codeArray[i]].address1.toUpperCase() != streetAddress1.toUpperCase()) {
+                                this.Logging(validationGR, 'log', '\n  -> ' + codes[codeArray[i]].label + '.Street Address 1 "' + codes[codeArray[i]].address1 + '" does not match "' + streetAddress1 + '" provided by LMC');
+                            }
+                            if (codes[codeArray[i]].address2.toUpperCase() != streetAddress2.toUpperCase()) {
+                                this.Logging(validationGR, 'log', '\n  -> ' + codes[codeArray[i]].label + '.Street Address 2 "' + codes[codeArray[i]].address2 + '" does not match "' + streetAddress2 + '" provided by LMC');
+                            }
+
+                            if (codes[codeArray[i]].city.toUpperCase() != city.toUpperCase()) {
+                                this.Logging(validationGR, 'log', '\n  -> ' + codes[codeArray[i]].label + '.City "' + codes[codeArray[i]].city + '" does not match "' + city + '" provided by LMC');
+                            }
+
+                            if (codes[codeArray[i]].state.toString().toUpperCase() != state.toUpperCase()) {
+                                this.Logging(validationGR, 'log', '\n  -> ' + codes[codeArray[i]].label + '.State "' + codes[codeArray[i]].state + '" does not match "' + state + '" provided by LMC');
+                            }
+
+                            if (codes[codeArray[i]].zip != zip) {
+                                this.Logging(validationGR, 'log', '\n  -> ' + codes[codeArray[i]].label + '.Zip "' + codes[codeArray[i]].zip + '" does not match "' + zip + '" provided by LMC');
+                            }
+
+                            var country_match = false;
+                            var countryUtil = new ABSPLCountries();
+                            var countryObj = countryUtil.GetCountriesObj();
+                            for (var j in countryObj.countries) {
+                                // first find a country object that matches our inbound payload country
+                                if (countryObj.countries[j]['name'] == codes[codeArray[i]].country ||
+                                    countryObj.countries[j]['iso3166_3'] == codes[codeArray[i]].country ||
+                                    countryObj.countries[j]['iso3166_2'] == codes[codeArray[i]].country) {
+                                    // then check if any of those values also match our LMC country
+                                    if (countryObj.countries[j]['name'] == country ||
+                                        countryObj.countries[j]['iso3166_3'] == country ||
+                                        countryObj.countries[j]['iso3166_2'] == country) {
+                                        // if we find a match on the same country object for both, we have a match
+                                        country_match = true;
+                                    }
+                                }
+                            }
+                            if (!country_match) {
+                                var countryLookupGR = new GlideRecord('x_att2_abs_procure_country_codes');
+                                countryLookupGR.addEncodedQuery('country=' + codes[codeArray[i]].country + '^ORcode=' + codes[codeArray[i]].country + '^ORlmc_code=' + codes[codeArray[i]].country + '^ORlmc_country=' + codes[codeArray[i]].country);
+                                countryLookupGR.addEncodedQuery('country=' + country + '^ORcode=' + country + '^ORlmc_code=' + country + '^ORlmc_country=' + country);
+                                countryLookupGR.query();
+                                if (countryLookupGR.hasNext())
+                                    country_match = true;
+
+                                if (!country_match) {
+                                    this.Logging(validationGR, 'log', 'log', '\n  -> ' + codes[codeArray[i]].label + '.Country "' + codes[codeArray[i]].country + '" does not match "' + country + '" provided by LMC');
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    this.Logging(validationGR, "log", "LMC ENDPOINT NOT AVAILABLE. Cannot validate CLLI information");
+                }
+            }
+        }
+        if (hasError)
+            validationGR.clli_invalid = true;
+    },
+
+
+    ValidateAttachments: function(validationGR, orderSummaryGR) {
+        var orderStageSysId = validationGR.sys_id + '';
+
+        var sdpMessage = '';
+        var configMessage = '';
+        var sdpErrorMessage = '';
+        var configErrorMessage = '';
+        var hasAttachmentError = false;
+
+        if (orderSummaryGR.sdp_required == true) {
+            var hasValidPPTXAttachment = this.CheckAttachment(orderStageSysId, '.PPTX');
+            if (!hasValidPPTXAttachment) {
+                sdpMessage = 'Error - SDP is required. Missing PPTX file required for processing.';
+                sdpErrorMessage = 'Error - SDP is required. Missing PPTX file required for processing.';
+                hasAttachmentError = true;
+            } else {
+                sdpMessage = 'Success - SDP is required. Found PPTX required for processing.';
+            }
+        } else {
+            sdpMessage = 'Success - Skipping SDP Attachment check. SDP Not Required is True.';
+        }
+
+        if (orderSummaryGR.config_required == true) {
+            var hasValidTXTAttachment = this.CheckAttachment(orderStageSysId, '.txt');
+            if (!hasValidTXTAttachment) {
+                configMessage = 'Error - Configuration is required. Missing TXT file required for processing.';
+                configErrorMessage = 'Error - Configuration is required. Missing TXT file required for processing.';
+                hasAttachmentError = true;
+            } else {
+                configMessage = 'Success - Configuration is required. Found TXT file required for processing.';
+            }
+        } else {
+            configMessage = 'Success - Skipping Config Attachment check. Config Not Required is True.';
+        }
+
+        var processing_log = '\n\nAttachment validation started -- ' + new GlideDateTime() + ' (GMT)';
+        processing_log += '\n  -> ' + sdpMessage;
+        processing_log += '\n  -> ' + configMessage;
+        this.Logging(orderSummaryGR, "log", processing_log);
+
+        if (hasAttachmentError == true) {
+            orderSummaryGR.attachment_missing = true;
+            var ageCheckQuery = "sys_created_onRELATIVELT@dayofweek@ago@7";
+            var isOlderThanSevenDays = GlideFilter.checkRecord(validationGR, ageCheckQuery);
+
+            if (isOlderThanSevenDays == true) {
+                orderSummaryGR.processing_log = 'Error';
+                if (sdpErrorMessage) {
+                    //this.Logging(orderSummaryGR, "error", "\n  -> " + sdpErrorMessage);
+                    this._logValidationError(validationGR, ABSPLAlerts.SDP_MISSING, sdpErrorMessage);
+                }
+                if (configErrorMessage) {
+                    //this.Logging(orderSummaryGR, "error", "\n  -> " + configErrorMessage);
+                    this._logValidationError(validationGR, ABSPLAlerts.SDP_MISSING, configErrorMessage);
+                }
+            }
+
+        } else {
+            orderSummaryGR.attachment_missing = false;
+        }
+
+        orderSummaryGR.error_details = this.error_message + "";
+        orderSummaryGR.processing_log += "\n\n" + this.processing_message + "";
+        return orderSummaryGR.attachment_missing;
+    },
+
+    CheckAttachment: function(orderStageRecSysId, contentType) {
+        var attachmentRec = new GlideRecord('sys_attachment');
+        attachmentRec.addEncodedQuery('table_name=x_att2_abs_procure_service_request^table_sys_id=' + orderStageRecSysId + '^file_nameLIKE' + contentType + '^size_bytes!=0');
+        attachmentRec.orderByDesc('sys_created_on');
+        attachmentRec.setLimit(1);
+        attachmentRec.query();
+
+        if (attachmentRec.next())
+            return true;
+
+        return false;
+
+    },
+
+    CheckLineItemsExist: function(payload_string) {
+        var payload = JSON.parse(payload_string + "");
+        if (payload.hasOwnProperty('LineItems')) {
+            if (payload.LineItems.length != 0) {
+                return true;
+            }
+        }
+        return false;
+    },
+
+    GetLineItemCount: function(payload_string) {
+        var payload = JSON.parse(payload_string + "");
+        return payload.LineItems.length;
+    },
+
+    CreateLineItems: function(stageOrderGR) {
+        var payload = JSON.parse(stageOrderGR.payload + "");
+        for (var i in payload.LineItems) {
+            var lineItemGR = new GlideRecord('x_att2_abs_procure_stage_order_line_item');
+            lineItemGR.staging_order = stageOrderGR.sys_id + "";
+            lineItemGR.processing_status = "Inserted";
+            this.ApplyJSON(lineItemGR, 'Line Item', JSON.stringify(payload.LineItems[i]));
+            var count = parseInt(i) + 1;
+            lineItemGR.line_order = count.toString().replace('.0', '');
+            lineItemGR.insert();
+        }
+    },
+
+    _objectDotWalk: function(obj, path) {
+        path = path.split('.');
+        var current = obj;
+        while (path.length) {
+            if (typeof current !== 'object') return undefined;
+            current = current[path.shift()];
+        }
+        return current;
+    },
+
+    // Validates that the input string is a valid date formatted as "mm/dd/yyyy"
+    _isValidDate: function(dateString) {
+        var delimiter, dayPos, monPos, yearPos;
+
+        var datePattern = this._getDatePattern(dateString);
+
+        // First check for the pattern
+        if (datePattern.v) {
+            delimiter = datePattern.dl;
+            dayPos = datePattern.d;
+            monPos = datePattern.m;
+            yearPos = datePattern.y;
+        } else {
+            return false;
+        }
+
+        // Parse the date parts to integers
+        var parts = dateString.split(delimiter);
+        var day = parseInt(parts[dayPos], 10);
+        var month = parseInt(parts[monPos], 10);
+        var year = parseInt(parts[yearPos], 10);
+
+        // Check the ranges of month and year
+        if (year < 1000 || year > 3000 || month == 0 || month > 12)
+            return false;
+
+        var monthLength = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+        // Adjust for leap years
+        if (year % 400 == 0 || (year % 100 != 0 && year % 4 == 0))
+            monthLength[1] = 29;
+
+        // Check the range of the day
+        return day > 0 && day <= monthLength[month - 1];
+    },
+
+    _getDatePattern: function(dateString) {
+        var delimiter, dayPos, monPos, yearPos;
+        var valid = false;
+
+        if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(dateString)) {
+            // AID SPECIFICATION, others are alternative handling
+            valid = true;
+            delimiter = "-";
+            monPos = 1;
+            dayPos = 2;
+            yearPos = 0;
+        } else if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(dateString)) {
+            valid = true;
+            delimiter = "/";
+            monPos = 0;
+            dayPos = 1;
+            yearPos = 2;
+        } else if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(dateString)) {
+            valid = true;
+            delimiter = "-";
+            monPos = 0;
+            dayPos = 1;
+            yearPos = 2;
+        } else if (/^\d{4}\/\d{1,2}\/\d{1,2}$/.test(dateString)) {
+            valid = true;
+            delimiter = "/";
+            monPos = 1;
+            dayPos = 2;
+            yearPos = 0;
+        }
+
+        return {
+            v: valid,
+            dl: delimiter,
+            m: monPos,
+            d: dayPos,
+            y: yearPos
+        };
+    },
+
+    Logging: function(validationGR, type, message) {
+        if (type == "error") {
+            if (validationGR.getTableName() == "x_att2_abs_procure_stage_order_line_item") {
+                this.line_error += message + "";
+                this.line_error = this.line_error.toString().trim();
+            } else {
+                this.error_message += message + "";
+                this.error_message = this.error_message.toString().trim();
+            }
+        } else if (type == "log") {
+            this.processing_message += message + "";
+            this.processing_message = this.processing_message.toString().trim();
+        }
+    },
+
+    _logValidationError: function(validationGR, errObj, detail) {
+        var code = parseInt(errObj.code),
+            msg = errObj.msg + '';
+        var fullErrMsg = msg + ' (' + code + '): ' + detail;
+        this.Logging(validationGR, 'error', '\n  -> ' + fullErrMsg);
+
+        var codeArr = validationGR.error_codes.nil() ? [] : (validationGR.error_codes + '').split(',');
+        var jsonArr = validationGR.error_json.nil() ? [] : JSON.parse(validationGR.error_json + '');
+        codeArr.push(code + '');
+        msg += ': ' + detail;
+        jsonArr.push({
+            code: code,
+            msg: msg
+        });
+        validationGR.processing_status = 'Error';
+        validationGR.processing_error = true;
+        validationGR.error_codes = codeArr.join(',');
+        validationGR.error_json = JSON.stringify(jsonArr);
+    },
+
+    _errorReset: function(validationGR) {
+        validationGR.error_details = '';
+        validationGR.error_codes = '';
+        validationGR.error_json = '';
+        validationGR.processing_status = 'Inserted';
+        validationGR.processing_error = false;
+        validationGR.mandatory_field_missing = false;
+        validationGR.attachment_missing = false;
+        validationGR.clli_invalid = false;
+        validationGR.product_model_invalid = false;
+
+        var stageOrder = new GlideRecord('x_att2_abs_procure_stage_order_summary');
+        stageOrder.addQuery('eol_number', validationGR.eol_number + "");
+        stageOrder.addQuery('processing_status', 'Error');
+        stageOrder.query();
+        while (stageOrder.next()) {
+            stageOrder.processing_status = "Error (Received Update)";
+            stageOrder.update();
+        }
+    },
+
+    _xmlNodeExist: function(node, tag) {
+        try {
+            if (tag == node.getNodeName()) {
+                //gs.info("Given node belongs to tag " + tag);
+                return true;
+            }
+        } catch (error) {
+            gs.error("Given node might not belong to tag " + tag + ". Error while checking: " + error);
+            return false;
+        }
+    },
+
+    _copyMarkForToShipTo: function(validationGR) {
+        validationGR.ship_to_clli_code = validationGR.mark_for_clli_code;
+        validationGR.ship_to_company_name = validationGR.mark_for_company_name;
+        validationGR.ship_to_contact_name = validationGR.mark_for_contact_name;
+        validationGR.ship_to_contact_e_mail = validationGR.mark_for_contact_e_mail;
+        validationGR.ship_to_contact_phone_number = validationGR.mark_for_contact_phone_number;
+        validationGR.ship_to_site_id = validationGR.mark_for_site_id;
+        validationGR.ship_to_street_address_line_1 = validationGR.mark_for_street_address_line_1;
+        validationGR.ship_to_street_address_line_2 = validationGR.mark_for_street_address_line_2;
+        validationGR.ship_to_city = validationGR.mark_for_city;
+        validationGR.ship_to_state_or_province = validationGR.mark_for_state_or_province;
+        validationGR.ship_to_zip_code_or_postal_code = validationGR.mark_for_zip_code_or_postal_code;
+        validationGR.ship_to_country = validationGR.mark_for_country;
+    },
+
+    type: 'ABSPLOrderProcessing'
+};
+
+ABSPLOrderProcessing.postToStaging = function( /*RESTAPIRequest*/ request, /*RESTAPIResponse*/ response) {
+    var responseCode = '200';
+    var responseStatus = 'success';
+    var responseMsg = 'Stage Order Summary Record Created';
+    var requestData = request.body.data || {};
+
+    //Log integration details
+    var integrationLog = new x_att2_abs_procure.ABSPLIntegrationLog(requestData.SendingSystem, "Inbound", "REST");
+    integrationLog.setRequest('Post', JSON.stringify(requestData), request.url, 'ABSPLOrderProcessing', 'postToStaging', request.headers);
+
+    //Create staging record
+    var stageRecord = new GlideRecord('x_att2_abs_procure_stage_order_summary');
+    stageRecord.payload = JSON.stringify(requestData);
+    stageRecord.processing_status = 'Inserted';
+    stageRecord.processing_log += "EOL Payload Received -- " + new GlideDateTime() + " (GMT)";
+    if (requestData.hasOwnProperty('EOLNumber'))
+        stageRecord.eol_number = requestData.EOLNumber + '' || '';
+    if (requestData.hasOwnProperty('OrderType'))
+        stageRecord.order_type = requestData.OrderType.toLowerCase() + '' || '';
+    if (requestData.hasOwnProperty('GemsOrg')) {
+        stageRecord.gems_org = requestData.GemsOrg + '' || '';
+        var accountRecord = new GlideRecord('customer_account');
+        accountRecord.addQuery('sn_tmt_core_external_id', stageRecord.gems_org);
+        accountRecord.query();
+        if (accountRecord.next()) {
+            stageRecord.account = accountRecord.sys_id;
+            stageRecord.processing_log += "\n  -> Account set with GemsOrg of " + stageRecord.gems_org;
+        } else
+            stageRecord.processing_log += "\n  -> No Account is found with GemsOrg of " + stageRecord.gems_org;
+    }
+    if (stageRecord.eol_number == '') {
+        responseStatus = 'error';
+        responseCode = '400';
+        responseMsg = 'EOL number was not sent';
+    }
+
+    if (stageRecord.order_type == '') {
+        responseStatus = 'error';
+        responseCode = '400';
+        responseMsg = 'Order type was not sent';
+    }
+
+    /* var validOrderTypes = ['new', 'cancel', 'return'];
+    if (validOrderTypes.indexOf(stageRecord.order_type + '') == -1) {
+        responseStatus = 'error';
+        responseCode = '400';
+        responseMsg = 'Order type of "' + stageRecord.order_type + '" is not a valid type';
+        stageRecord.order_type = '';
+    } 
+	*/ // Handled by staging validations
+
+    if (!requestData.hasOwnProperty('LineItems') || requestData.LineItems.length == 0) {
+        if (stageRecord.order_type != 'cancel') {
+            responseStatus = 'error';
+            responseCode = '400';
+            responseMsg = 'LineItems is missing or empty';
+        }
+    }
+
+    /*
+    if (requestData.hasOwnProperty('LineItems')) {
+        if (typeof(requestData.LineItems) == "object") {
+            for (var i in requestData.LineItems) {
+                var actionObject = {
+                    "new": "new",
+                    "cancel": "cancel",
+                    "update": "add,keep,delete",
+                    "return": "return",
+                    "move": "move"
+                };
+                if (stageRecord.order_type.toString() in actionObject) {
+                    if (actionObject[stageRecord.order_type.toString().toLowerCase()].indexOf(requestData.LineItems[i]['LineItemAction'].toString().toLowerCase()) == -1) {
+                        responseStatus = 'error';
+                        responseCode = '400';
+                        responseMsg = 'Line Item Action of "' + requestData.LineItems[i]['LineItemAction'] + '" is not valid with an order type of "' + stageRecord.order_type + '"';
+                    }
+                }
+            }
+        }
+    }
+	*/ // Handled by staging validations
+
+    stageRecord.processing_log += "\n  -> " + responseMsg;
+    var recordID = '';
+    if (responseCode == '200')
+        recordID = stageRecord.insert();
+
+    integrationLog.setTableInstance(stageRecord.getTableName(), recordID);
+
+    // Set Response body
+    var respObj = {};
+    respObj.platform = "ABSPL";
+    respObj.datetime = new GlideDateTime().getValue() + '';
+    respObj.status = responseStatus;
+    respObj.msg = responseMsg;
+
+    var responseData = {
+        sysID: "",
+        StageOrderSummaryKey: "",
+        LineItemCount: "",
+    };
+    if (responseCode == '200') {
+        responseData.sysID = recordID + '';
+        responseData.StageOrderSummaryKey = stageRecord.number + '';
+        responseData.LineItemCount =
+            requestData.hasOwnProperty('LineItems') && Array.isArray(requestData.LineItems) ?
+            requestData.LineItems.length : 0;
+    }
+    respObj.data = responseData;
+
+    response.setStatus(responseCode);
+    response.setBody(respObj);
+
+    integrationLog.setResponse(JSON.stringify(respObj), responseCode);
+    if (responseStatus == 'success')
+        integrationLog.setLogStatus('Processed');
+    else
+        integrationLog.setLogStatus('Error');
+    integrationLog.update();
+};
+
+ABSPLOrderProcessing.addAttachmentREST = function( /*RESTAPIRequest*/ request, /*RESTAPIResponse*/ response) {
+    var status = '200';
+    var errorCode;
+    var statusMsg = '';
+    var requestData = request.body.data || {};
+
+    var sendingSystem = requestData.SendingSystem || "Attachment";
+
+    //Log Integration Details
+    var integrationLog = new x_att2_abs_procure.ABSPLIntegrationLog(sendingSystem, "Inbound", "REST");
+    integrationLog.setRequest('POST', JSON.stringify(requestData), request.url, 'ABS Equipment Order', 'Add Attachment', request.headers);
+
+    var mandatoryFields = ['EOLNumber', 'FileName', 'DocumentType'];
+
+    for (var manIdx = 0; manIdx < mandatoryFields.length; manIdx++) {
+        var mandatoryField = mandatoryFields[manIdx];
+        if (global.JSUtil.nil(requestData[mandatoryField])) {
+            status = '400';
+            errorCode = ABSPLAlerts.FIELD_VALUE_MISSING.code;
+            errorMsg = ABSPLAlerts.FIELD_VALUE_MISSING.msg + ': ' + mandatoryField;
+            statusMsg = 'Mandatory field not provided in payload - ' + mandatoryField;
+            return responseMsg(status, statusMsg, {
+                code: errorCode,
+                msg: errorMsg
+            });
+        }
+    }
+
+    var eolNumber = requestData.EOLNumber + '';
+    var fileName = requestData.FileName + '';
+    var contentType = requestData.FileContentType + '';
+    var fileData = requestData.FileData + '';
+    var documentType = requestData.DocumentType + '';
+
+    if (documentType != "CFG" && documentType != "SDP") {
+        status = '400';
+        errorCode = ABSPLAlerts.DOC_TYPE_INVALID.code;
+        errorMsg = ABSPLAlerts.DOC_TYPE_INVALID.msg + ': ' + documentType;
+        statusMsg = 'DocumentType of "' + documentType + '" is not valid';
+        return responseMsg(status, statusMsg, {
+            code: errorCode,
+            msg: errorMsg
+        });
+    }
+
+    var fileArr = fileName.toString().split('.');
+    var fileExt = fileArr[fileArr.length - 1] + "";
+    var validExtensions = ["txt", "pdf", "ppt", "pptx", "xls", "xlsx", "doc", "docx"];
+    if (validExtensions.indexOf(fileExt.toLowerCase()) == -1) {
+        status = '400';
+        errorCode = ABSPLAlerts.FILE_EXT_INVALID.code;
+        errorMsg = ABSPLAlerts.FILE_EXT_INVALID.msg + ': ' + fileExt;
+        statusMsg = 'File extension of "' + fileExt + '" is not valid';
+        return responseMsg(status, statusMsg, {
+            code: errorCode,
+            msg: errorMsg
+        });
+    }
+
+    // check if an order has already been created
+    var orderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+    if (orderGR.get('eol_number', eolNumber + "")) {
+        var serviceRequestGR = new GlideRecord('x_att2_abs_procure_service_request');
+        if (serviceRequestGR.get('sys_id', orderGR.service_request_number + "")) {
+            integrationLog.setTableInstance(serviceRequestGR.getTableName(), serviceRequestGR.sys_id + "");
+            return responseMsg(status, statusMsg, {
+                "table_sys_id": integrationLog.getLogSysID(),
+                "table_name": "x_att2_abs_procure_integration_log"
+            });
+        }
+    } else {
+        //Creation stage record
+        var orderStageRecord = new GlideRecord('x_att2_abs_procure_stage_order_summary');
+        orderStageRecord.addEncodedQuery('eol_number=' + eolNumber);
+        orderStageRecord.orderByDesc('sys_created_on');
+        orderStageRecord.setLimit(1);
+        orderStageRecord.query();
+
+        if (orderStageRecord.next()) {
+            integrationLog.setTableInstance(orderStageRecord.getTableName(), orderStageRecord.sys_id + "");
+            status = '200';
+            statusMsg = 'File successfully attached to staging record ' + eolNumber;
+            return responseMsg(status, statusMsg, {
+                "table_sys_id": integrationLog.getLogSysID(),
+                "table_name": "x_att2_abs_procure_integration_log"
+            });
+        } else {
+            status = '400';
+            errorCode = ABSPLAlerts.FIELD_VALUE_INVALID.code;
+            errorMsg = ABSPLAlerts.FIELD_VALUE_INVALID.msg + ': EOL Number/Order Summary Key';
+            statusMsg = 'EOL Number/Order Summary Key could not be found';
+            return responseMsg(status, statusMsg, {
+                code: errorCode,
+                msg: errorMsg
+            });
+        }
+    }
+
+    function getFileName(tableName, tableID, fileName) {
+        var versionStr = '_v_';
+        var fileArr = fileName.toString().split('.');
+        var fileExt = fileArr[fileArr.length - 1] + "";
+        var onlyName = fileName.toString().replace('.' + fileExt, '');
+
+        var attachGR = new GlideRecord('sys_attachment');
+        attachGR.addQuery('table_sys_id', tableID);
+        attachGR.addQuery('table_name', tableName);
+        attachGR.addQuery('file_name', 'STARTSWITH', onlyName);
+        attachGR.orderByDesc('sys_created_on');
+        attachGR.query();
+        if (attachGR.next()) {
+            if (attachGR.file_name.indexOf('_v_') != -1) {
+                fileArr = attachGR.file_name.toString().split('.');
+                fileExt = fileArr[fileArr.length - 1] + "";
+                onlyName = attachGR.file_name.toString().replace('.' + fileExt, '');
+                var versionNum = onlyName.substring(onlyName.indexOf(versionStr) + 3, onlyName.indexOf(versionStr) + 4);
+                var new_onlyName = onlyName.replace(versionStr + versionNum, '');
+                var new_versionNum = parseInt(versionNum) + 1;
+                return new_onlyName + versionStr + new_versionNum + "." + fileExt;
+            } else {
+                return onlyName + versionStr + '2.' + fileExt;
+            }
+        }
+
+        return fileName;
+    }
+
+    function responseMsg(status, msg, data) {
+        var respObj = {};
+
+        respObj.platform = "ABSPL";
+        respObj.datetime = new GlideDateTime().getValue() + '';
+        response.setStatus(status);
+        response.status = status;
+        respObj.status = "success";
+        if (status == "400")
+            respObj.status = "error";
+        respObj.msg = msg;
+        respObj.data = data || {};
+
+        response.setBody(respObj);
+
+        integrationLog.setResponse(JSON.stringify(respObj), status);
+        if (respObj.status == 'success')
+            integrationLog.setLogStatus('Pending');
+        else
+            integrationLog.setLogStatus('Failed');
+        integrationLog.updateLog();
+        return respObj;
+    }
+};
