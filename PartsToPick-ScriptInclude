@@ -1,0 +1,144 @@
+var PartsToPick = Class.create();
+PartsToPick.prototype = {
+    initialize: function() {
+    },
+
+	partstopick: function(sysId,requestBody,responseBody) {
+		 var dateTimeNow = new GlideDateTime().getDisplayValue();
+		gs.info("Parts to pick SI - Execution started 8:")
+		
+		var ol = new GlideRecord('x_att2_abs_procure_purchase_line');
+		ol.addQuery('sys_id',sysId);
+		ol.query();
+		gs.info("Parts to pick SI - Inside OL 13");
+	    if(ol.next()){
+			var id = ol.getValue('sys_id');
+			//ol.setValue('state', 'open');
+            ol.setValue('status', 'picklist');
+			gs.info("Parts to pick SI - Inside if 18: " + ol.status);
+			ol.update();
+		}
+		
+		gs.info("Parts to pick SI - outside ol 21");
+		
+		var gr1 = new GlideRecord('x_att2_abs_procure_purchase_line_items');
+            // userGR.addQuery('sys_id', 'IN', current.getValue('watch_list'));
+            gr1.addQuery('purchase_line',id);
+            gr1.query();
+            gs.info("Before while 27");
+            while (gr1.next()) {
+//                 gr1.setValue('u_state', 'open');
+//                 gr1.setValue('u_substate', 'picking');
+//                 gr1.setValue('picklist_sent_date', dateTimeNow);
+//                 gs.info("Parts to pick- picklist date 32:" + dateTimeNow)
+//                 // gr1.task_number = gr.number;//
+//                 gr1.update();
+                gs.info("Inside while update status 134");
+                if (current.alternate_ship_to_address == '') {
+                    var grRec = new GlideRecord("x_att2_abs_procure_staging");
+                    grRec.initialize();
+                    grRec.u_number = ol.sys_id;
+                    grRec.u_case_number = ol.getValue('order_case_number');
+                    gs.info("inside staging order case number 41 :");
+
+                    grRec.u_address_line = ol.getDisplayValue('mark_for');
+                    grRec.u_city = ol.getDisplayValue('u_city');
+                    grRec.u_country = ol.getDisplayValue('u_country');
+                    grRec.u_state = ol.getDisplayValue('u_state_or_province');
+                    grRec.u_zip = ol.getDisplayValue('u_zip_code_1');
+                    grRec.u_room_number = ol.getDisplayValue('room_number_mf');
+                    grRec.u_contact_name = ol.getDisplayValue('contact_name');
+                    grRec.u_contact_phone =ol.getDisplayValue('contact_number');
+                    grRec.u_company_name = ol.getDisplayValue('company_name1');
+                    grRec.u_action = "New";
+                    gs.info("parts to pick - if after new 53");
+                    grRec.u_order_line_item_number = gr1.sales_order_line_number;
+                    grRec.u_warehouse_location = gr1.u_department.getDisplayValue();
+                    grRec.u_warehouse_id = gr1.getDisplayValue('warehouse_id'); //"CTDI Buford";
+                    grRec.u_part_number = gr1.u_part_number;
+                    grRec.u_po_number = gr1.po_number;
+                    gs.info("parts to pick - if po number.");
+                    grRec.u_qauntity = gr1.purchased_quantity; //purchased_quantity
+                    grRec.u_ownership = gr1.getDisplayValue('ownership');
+                    grRec.u_manufacturer_part_number = gr1.u_manufacturer_part_number;
+                    // grRec.u_supplier_name = gr1.getDisplayValue('supplier');
+                    // grRec.u_model = gr1.getDisplayValue('hardware_model');
+                    grRec.u_manufacturer = gr1.getDisplayValue('manufacturer');
+                    grRec.u_destination = 'ctdi';
+                    grRec.u_log = 'BR-ctdi-Create Json file for Parts to pick';
+                    grRec.u_source = 'Hermes';
+                    grRec.u_status = "Success";
+                    grRec.u_response = responseBody.toString();
+                    grRec.u_request = requestBody;
+                    var stageId = grRec.insert();
+                    gs.info("parts to pick - if Inside while update status last 73");
+                } else {
+
+                    var grRec = new GlideRecord("x_att2_abs_procure_staging");
+                    grRec.initialize();
+                    grRec.u_number = ol.sys_id;
+                    grRec.u_case_number = ol.getValue('order_case_number');
+                    gs.info("inside staging order case number");
+
+                    grRec.u_address_line = ol.getDisplayValue('mark_for');
+                    grRec.u_city = ol.getDisplayValue('u_city');
+                    grRec.u_country = ol.getDisplayValue('alt_country');
+                    grRec.u_state = ol.getDisplayValue('alt_state');
+                    grRec.u_zip = ol.getDisplayValue('alt_zip_code');
+                    grRec.u_room_number = ol.getDisplayValue('room_number_mf');
+                    grRec.u_contact_name = ol.getDisplayValue('contact_name');
+                    grRec.u_contact_phone = ol.getDisplayValue('contact_number');
+                    grRec.u_company_name = ol.getDisplayValue('company_name1');
+
+                    //grRec.u_alternate_ship_to_address = current.getDisplayValue('alternate_ship_to_address');
+                    grRec.u_action = "New";
+                    gs.info("parts to pick - else after new");
+                    grRec.u_order_line_item_number = gr1.sales_order_line_number;
+                    grRec.u_warehouse_location = gr1.u_department.getDisplayValue();
+                    grRec.u_warehouse_id = gr1.getDisplayValue('warehouse_id'); //"CTDI Buford";
+                    grRec.u_part_number = gr1.u_part_number;
+                    grRec.u_po_number = gr1.po_number;
+                    gs.info("parts to pick - else po number.");
+                    grRec.u_qauntity = gr1.purchased_quantity; //purchased_quantity
+                    grRec.u_ownership = gr1.getDisplayValue('ownership');
+                    grRec.u_manufacturer_part_number = gr1.u_manufacturer_part_number;
+                    // grRec.u_supplier_name = gr1.getDisplayValue('supplier');
+                    // grRec.u_model = gr1.getDisplayValue('hardware_model');
+                    grRec.u_manufacturer = gr1.getDisplayValue('manufacturer');
+                    grRec.u_destination = 'ctdi';
+                    grRec.u_log = 'BR-ctdi-Create Json file for Parts to pick';
+                    grRec.u_source = 'Hermes';
+                    grRec.u_status = "Success";
+                    grRec.u_response = responseBody.toString();
+                    grRec.u_request = requestBody;
+                    var stageId1 = grRec.insert();
+                    gs.info("parts to pick - else Inside while update status last");
+
+				}
+				}
+           
+		
+		
+	},
+	
+	partstopickError: function(sysId1) {
+		 
+		gs.info("Parts to pick SI - Execution started 8:")
+		
+		var ol = new GlideRecord('x_att2_abs_procure_purchase_line');
+		ol.addQuery('sys_id',sysId1);
+		ol.query();
+		gs.info("Parts to pick SI - Inside OL 13");
+	    if(ol.next()){
+			
+			
+            ol.setValue('status', 'picklist_sent');
+			gs.info("Parts to pick SI - Inside if 136: " + ol.status);
+			ol.update();
+		}
+	},
+	
+	
+	
+    type: 'PartsToPick'
+};
