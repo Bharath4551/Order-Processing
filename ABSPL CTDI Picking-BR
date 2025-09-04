@@ -1,0 +1,14 @@
+(function executeRule(current, previous /*null when async*/ ) {
+
+    //Send Parts to Pick
+    var ctdiUtil = new x_att2_abs_procure.ABSPLCTDIIntegration();
+    var ptpResponse = ctdiUtil.sendPickList(current);
+    current.processing_log += '\n\nParts To Pick Sent to CTDI -- ' + new GlideDateTime() + ' (GMT)';
+    current.processing_log += '\n  -> Response - ' + ptpResponse;
+    current.processing_log = current.processing_log.toString().trim();
+
+    //Call update in asyn business rule
+    current.setWorkflow(false);
+    current.update();
+
+})(current, previous);
