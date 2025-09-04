@@ -1,0 +1,1743 @@
+var ABSPLCTDIIntegration = Class.create();
+
+ABSPLCTDIIntegration.prototype = {
+    initialize: function() {
+        this._restMessage = 'CTDI Integration';
+        this._ctdiConnectionInfo = this._getCtdiConnectionInfo();
+        this._ctdiUrl = this._ctdiConnectionInfo.url + '';
+        this._authToken = this._getToken(this._ctdiConnectionInfo);
+        this._eolSysID = '';
+        this._errorASG = '3df59c34eb5156901c75fd77cad0cd5d' /* ABSPL Admin */ ;
+        this._reverseSpecialistGroup = '9dbe156093ff8ad44c18f8f17cba10b8';
+        if (new ABSPLCommonUtil().getInstanceStack() == 'FEDGOV')
+            this._sendingSystem = "SNWFEDGOV";
+        else
+            this._sendingSystem = "SNW";
+    },
+
+    sendLabelBox: function(eolOrderRecord, orderTaskRecord, sendBox, sendLabel) {
+        if (this._authToken == '') {
+            return false;
+        }
+
+        this._eolSysID = eolOrderRecord.sys_id + '';
+
+        var ptpJSON = {};
+        ptpJSON.SR = eolOrderRecord.eol_number + '';
+        //ptpJSON.SR = eolOrderRecord.service_request_number.service_request + '';
+        //ptpJSON.EOL = eolOrderRecord.eol_number + '';
+        ptpJSON.TicketNumber = orderTaskRecord.number + '';
+        ptpJSON.AddressLine1 = eolOrderRecord.mark_for_street_address_line_1 + '';
+        ptpJSON.AddressLine2 = eolOrderRecord.mark_for_street_address_line_2 + '';
+        ptpJSON.City = eolOrderRecord.mark_for_city + '';
+        ptpJSON.CompanyName = eolOrderRecord.company_name + '';
+        ptpJSON.ContactName = eolOrderRecord.mark_for_contact_name + '';
+        ptpJSON.ContactPhone = eolOrderRecord.mark_for_contact_phone_number + '';
+        ptpJSON.ContactEmail = eolOrderRecord.mark_for_contact_e_mail + '';
+        ptpJSON.Country = eolOrderRecord.mark_for_country.iso3166_3 + '';
+        ptpJSON.Province = eolOrderRecord.mark_for_state_or_province + '';
+        ptpJSON.Zip = eolOrderRecord.mark_for_zip_code_or_postal_code + '';
+        ptpJSON.SendingSystem = this._sendingSystem + '';
+        ptpJSON.WarehouseId = !eolOrderRecord.warehouse.nil() ? eolOrderRecord.warehouse.ctdi_id + "" : this._getWarehouseFromOrder(eolOrderRecord.mark_for_country + "");
+        ptpJSON.WarehouseLocation = this._getReturnStockroomFromOrder(eolOrderRecord);
+        ptpJSON.SendBox = sendBox + '';
+        ptpJSON.SendLabel = sendLabel + '';
+
+        var ctdiJsonBody = {
+            "SendLabelBox": ptpJSON
+        };
+
+        var sendBoxResponse = this._sendRequestToCTDI(ctdiJsonBody, 'SendLabelBox');
+        var responseStatus = sendBoxResponse.getStatusCode() + '';
+        var responseBodyStr = sendBoxResponse.getBody();
+
+        if (!responseStatus.startsWith('2')) {
+            this._createInterventionTask(eolOrderRecord, 'Send Label Box', responseBodyStr, this._errorASG);
+            orderTaskRecord.work_notes = 'CTDI Integration Error - SendLabelBox - Received the following response - \n' + responseBodyStr;
+            return false;
+        } else {
+            orderTaskRecord.work_notes = 'CTDI Integration Success - SendLabelBox - Received the following response - \n' + responseBodyStr;
+            return true;
+        }
+
+    },
+
+    sendPickList: function(eolOrderRecord, eolAction) {
+        if (this._authToken == '') {
+            return false;
+        }
+
+        this._eolSysID = eolOrderRecord.sys_id + '';
+        var ptpJSON = {};
+        ptpJSON.SR = eolOrderRecord.service_request_number.service_request + '';
+        ptpJSON.ServiceLine = eolOrderRecord.service_line.name + '';
+        ptpJSON.SendingSystem = this._sendingSystem + '';
+        ptpJSON.InternationalShipment = false;
+        ptpJSON.WarehouseId = !eolOrderRecord.warehouse.nil() ? eolOrderRecord.warehouse.ctdi_id + "" : this._getWarehouseFromOrder(eolOrderRecord.mark_for_country + "");
+
+        if (eolOrderRecord.alternate_ship_to_country.nil()) {
+            ptpJSON.AddressLine1 = eolOrderRecord.mark_for_street_address_line_1 + '';
+            ptpJSON.AddressLine2 = eolOrderRecord.mark_for_street_address_line_2 + '';
+            ptpJSON.Room = "";
+            ptpJSON.City = eolOrderRecord.mark_for_city + '';
+            ptpJSON.CompanyName = eolOrderRecord.company_name + '';
+            ptpJSON.ContactName = eolOrderRecord.mark_for_contact_name + '';
+            ptpJSON.ContactPhone = eolOrderRecord.mark_for_contact_phone_number + '';
+            ptpJSON.Country = eolOrderRecord.mark_for_country.iso3166_3 + '';
+            ptpJSON.Province = eolOrderRecord.mark_for_state_or_province + '';
+            ptpJSON.Zip = eolOrderRecord.mark_for_zip_code_or_postal_code + '';
+        } else {
+            ptpJSON.AddressLine1 = eolOrderRecord.alternate_ship_to_address_street_address_line_1 + '';
+            ptpJSON.AddressLine2 = eolOrderRecord.alternate_ship_to_address_street_address_line_2 + '';
+            ptpJSON.Room = "";
+            ptpJSON.City = eolOrderRecord.alternate_ship_to_address_city + '';
+            ptpJSON.CompanyName = eolOrderRecord.alternate_ship_to_company_name + '';
+            ptpJSON.ContactName = eolOrderRecord.alternate_ship_to_address_contact_name + '';
+            ptpJSON.ContactPhone = eolOrderRecord.alternate_ship_to_address_contact_phone_number + '';
+            ptpJSON.Country = eolOrderRecord.alternate_ship_to_country.iso3166_3 + '';
+            ptpJSON.Province = eolOrderRecord.alternate_ship_to_address_state_or_province + '';
+            ptpJSON.Zip = eolOrderRecord.alternate_ship_to_address_zip_code_or_postal_code + '';
+        }
+
+        if (ptpJSON.Country != eolOrderRecord.ship_to_country.iso3166_3.toString())
+            ptpJSON.InternationalShipment = true;
+
+        if (eolAction != '' && eolAction != undefined) {
+            ptpJSON.Action = eolAction;
+        } else {
+            ptpJSON.Action = "New";
+        }
+
+        // Need to figure out what this is
+        ptpJSON.VNFList = [{
+            "AttVNFPartNumber": "",
+            "VNFSoftwareVersion": ""
+        }];
+
+        var partsListItems = [];
+        var lineItemRec = new GlideRecord('x_att2_abs_procure_abspl_order_line_item');
+        lineItemRec.addQuery('order', eolOrderRecord.getValue('sys_id'));
+        if (eolAction != "Cancel")
+            lineItemRec.addQuery('state', '!=', 'Cancelled');
+        lineItemRec.query();
+
+        while (lineItemRec.next()) {
+            var poNumber = '';
+            var warehouseComments = eolOrderRecord.warehouse_comments + '';
+
+            var sublineItemRec = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+            sublineItemRec.addQuery('order_line_key', lineItemRec.sys_id + '');
+            sublineItemRec.query();
+            if (sublineItemRec.next())
+                poNumber = sublineItemRec.po_number;
+
+            var action = "New";
+            if (lineItemRec.latest_action.toUpperCase() == "DELETE" || lineItemRec.latest_action.toUpperCase() == "CANCEL")
+                action = "Cancel";
+            if (lineItemRec.latest_action.toUpperCase() == "KEEP" && lineItemRec.quantity != lineItemRec.previous_quantity)
+                action = "Change";
+            if (lineItemRec.latest_action.toUpperCase() == "KEEP" && lineItemRec.quantity == lineItemRec.previous_quantity)
+                action = "";
+
+            if (eolAction != '' && eolAction != undefined) {
+                action = eolAction;
+            }
+            if (eolOrderRecord.eligible_stock_pos != '')
+                warehouseComments += '\n\nEligible Stock PO(s): ' + eolOrderRecord.eligible_stock_pos + '';
+
+
+            var partDetails = {
+                "partListItems": {
+                    "Action": action,
+                    "EOL": eolOrderRecord.eol_number + "",
+                    "WarehouseComments": warehouseComments + "",
+                    "ManName": lineItemRec.model.manufacturer.name + '',
+                    "ManPartNumber": lineItemRec.model.model_number + '',
+                    "OwnerShip": "ATT Owned",
+                    "Subtype": eolOrderRecord.subtype + '',
+                    "PONumber": poNumber + '',
+                    "Quantity": lineItemRec.quantity + '',
+                    "ConfigSequence": lineItemRec.configuration_sequence_number + '' || '',
+                    "WarehouseLocation": this._getSublineStockroom(lineItemRec)
+                }
+            };
+
+            partsListItems.push(partDetails);
+        }
+
+        ptpJSON.PartList = partsListItems;
+
+        var ctdiJsonBody = {
+            "PartsToPick": ptpJSON
+        };
+        var partsToPickResponse = this._sendRequestToCTDI(ctdiJsonBody, 'PartsToPick');
+        var responseStatus = partsToPickResponse.getStatusCode() + '';
+        var responseBodyStr = partsToPickResponse.getBody();
+
+        if (!responseStatus.startsWith('2')) {
+            new ABSPLCommonUtil().updateProcessingLog(eolOrderRecord, 'PartsToPick message unsuccessful--files not uploaded');
+            this._createInterventionTask(eolOrderRecord, 'Parts To Pick', responseBodyStr, this._errorASG);
+            return false;
+        } else {
+            //Send Attachments
+            new ABSPLCTDIIntegration().sendUnsentFiles(eolOrderRecord.service_request_number.getRefRecord(), eolOrderRecord);
+            return true;
+        }
+    },
+
+    sendPickListFromTask: function(taskRecord, location, parts) {
+        if (this._authToken == '') {
+            return false;
+        }
+
+        this._eolSysID = taskRecord.sys_id + '';
+        var ptpJSON = {};
+        ptpJSON.SR = taskRecord.number + '';
+        ptpJSON.AddressLine1 = location.street_address_line_1 + '';
+        ptpJSON.AddressLine2 = location.street_address_line_2 + '';
+        ptpJSON.Room = "";
+        ptpJSON.City = location.city + '';
+        ptpJSON.CompanyName = location.company_name + '';
+        ptpJSON.ContactName = location.contact_name + '';
+        ptpJSON.ContactPhone = location.contact_phone_number + '';
+        ptpJSON.Country = location.country_iso3166_3 + '';
+        ptpJSON.Province = location.province + '';
+        ptpJSON.Zip = location.zip + '';
+        ptpJSON.SendingSystem = this._sendingSystem + '';
+        ptpJSON.InternationalShipment = true;
+        ptpJSON.WarehouseId = location.warehouse + '';
+
+        ptpJSON.Action = "New";
+
+        // Need to figure out what this is
+        ptpJSON.VNFList = [{
+            "AttVNFPartNumber": "",
+            "VNFSoftwareVersion": ""
+        }];
+
+        var partsListItems = [];
+
+        for (var p = 0; p < parts.length; p++) {
+            var action = "New";
+
+            var partDetails = {
+                "partListItems": {
+                    "Action": action,
+                    "EOL": taskRecord.number + "",
+                    "ManName": parts[p].manufacturer + '',
+                    "ManPartNumber": parts[p].model_number + '',
+                    "OwnerShip": "ATT Owned",
+                    "PONumber": parts[p].po_number ? parts[p].po_number + '' : '',
+                    "Quantity": parts[p].quantity + '',
+                    "ConfigSequence": parts[p].config_sequence + '',
+                    "WarehouseLocation": parts[p].warehouse.toString().toUpperCase()
+                }
+            };
+
+            partsListItems.push(partDetails);
+        }
+
+        ptpJSON.PartList = partsListItems;
+
+        var ctdiJsonBody = {
+            "PartsToPick": ptpJSON
+        };
+
+        var partsToPickResponse = this._sendRequestToCTDI(ctdiJsonBody, 'PartsToPick', 'x_att2_abs_procure_abs_order_task');
+        var responseStatus = partsToPickResponse.getStatusCode() + '';
+        var responseBodyStr = partsToPickResponse.getBody();
+
+        if (!responseStatus.startsWith('2')) {
+            this._createInterventionTask(eolOrderRecord, 'Parts To Pick', responseBodyStr, this._errorASG);
+            return false;
+        } else {
+            return true;
+        }
+    },
+
+    sendInnerWarehouseTransfer: function(taskRecord, location, parts) {
+        if (this._authToken == '') {
+            return false;
+        }
+
+        this._eolSysID = taskRecord.sys_id + '';
+        var ptpJSON = {};
+        ptpJSON.SendingSystem = this._sendingSystem + '';
+        ptpJSON.WarehouseId = location.WarehouseId + '';
+        ptpJSON.FromWarehouseLocation = location.FromWarehouseLocation + '';
+        ptpJSON.ToWarehouseLocation = location.ToWarehouseLocation + '';
+        ptpJSON.ReferenceNumber = location.ReferenceNumber + '';
+        //ptpJSON.WarehouseComments = location.WarehouseComments + '';
+
+        var partsListItems = [];
+
+        for (var p = 0; p < parts.length; p++) {
+            var action = "New";
+
+            var partDetails = {
+                "ManName": parts[p].manufacturer + '',
+                "ManPartNumber": parts[p].model_number + '',
+                "Quantity": parts[p].quantity + '',
+                "ConfigSequence": parts[p].config_sequence + ''
+            };
+
+            partsListItems.push(partDetails);
+        }
+
+        ptpJSON.PartList = partsListItems;
+
+        var partsToPickResponse = this._sendRequestToCTDI(ptpJSON, 'PartsToTransfer', 'x_att2_abs_procure_abs_order_task');
+        var responseStatus = partsToPickResponse.getStatusCode() + '';
+        var responseBodyStr = partsToPickResponse.getBody();
+
+        if (!responseStatus.startsWith('2')) {
+            this._createInterventionTask(eolOrderRecord, 'Inner Warehouse Transfer', responseBodyStr, this._errorASG);
+            return false;
+        } else {
+            return true;
+        }
+    },
+
+    dynamicStockroom: function(taskRecord, action, warehouseID, data) {
+        if (this._authToken == '') {
+            return false;
+        }
+
+        this._eolSysID = taskRecord.sys_id + '';
+        var ptpJSON = {};
+        ptpJSON.SendingSystem = this._sendingSystem + '';
+        ptpJSON.Action = action + '';
+        ptpJSON.WarehouseId = warehouseID || "CTDI";
+
+        var stockroomList = [];
+
+        for (var d = 0; d < data.length; d++) {
+            var locationDetails = {
+                "WarehouseLocation": data[d].name.toString().toUpperCase(),
+                "ParentWarehouseLocation": data[d].parent.toString().toUpperCase(),
+            };
+
+            stockroomList.push(locationDetails);
+        }
+
+        ptpJSON.Locations = stockroomList;
+
+        var partsToPickResponse = this._sendRequestToCTDI(ptpJSON, 'DynamicStockRoom ', 'x_att2_abs_procure_abs_order_task');
+        var responseStatus = partsToPickResponse.getStatusCode() + '';
+        var responseBodyStr = partsToPickResponse.getBody();
+
+        if (!responseStatus.startsWith('2')) {
+            this._createInterventionTask(eolOrderRecord, 'Dynamic Stockroom', responseBodyStr, this._errorASG);
+            return false;
+        } else {
+            return true;
+        }
+    },
+
+    sendRecoverList: function(eolOrderRecord, eolAction) {
+        if (this._authToken == '') {
+            return false;
+        }
+
+        this._eolSysID = eolOrderRecord.sys_id + '';
+        var ptpJSON = {};
+        //ptpJSON.SR = eolOrderRecord.eol_number + '';
+        ptpJSON.SR = eolOrderRecord.service_request_number.service_request + '';
+        ptpJSON.SendingSystem = this._sendingSystem + '';
+        ptpJSON.AddressLine1 = eolOrderRecord.mark_for_street_address_line_1 + '';
+        ptpJSON.AddressLine2 = eolOrderRecord.mark_for_street_address_line_2 + '';
+        ptpJSON.Room = "";
+        ptpJSON.City = eolOrderRecord.mark_for_city + '';
+        ptpJSON.CompanyName = eolOrderRecord.company_name + '';
+        ptpJSON.ContactName = eolOrderRecord.mark_for_contact_name + '';
+        ptpJSON.ContactPhone = eolOrderRecord.mark_for_contact_phone_number + '';
+        ptpJSON.ContactEmail = eolOrderRecord.mark_for_contact_e_mail + '';
+        ptpJSON.AlternateContactName = eolOrderRecord.mark_for_alternate_contact_name + '';
+        ptpJSON.AlternateContactPhone = eolOrderRecord.mark_for_alternate_contact_phone_number + '';
+        ptpJSON.AlternateContactEmail = eolOrderRecord.mark_for_alternate_contact_e_mail + '';
+        ptpJSON.Country = eolOrderRecord.mark_for_country.iso3166_3 + '';
+        ptpJSON.Province = eolOrderRecord.mark_for_state_or_province + '';
+        ptpJSON.Zip = eolOrderRecord.mark_for_zip_code_or_postal_code + '';
+        ptpJSON.WarehouseId = !eolOrderRecord.warehouse.nil() ? eolOrderRecord.warehouse.ctdi_id + "" : this._getWarehouseFromOrder(eolOrderRecord.mark_for_country + "");
+        ptpJSON.WarehouseLocation = this._getReturnStockroomFromOrder(eolOrderRecord);
+        ptpJSON.ServiceLine = eolOrderRecord.service_line.name + "";
+        ptpJSON.Subtype = eolOrderRecord.subtype + "";
+        var orderReturnSetting = this._getReturnSettingForOrder(eolOrderRecord);
+        ptpJSON.SendBox = orderReturnSetting.sendBox + "";
+        ptpJSON.SendLabel = orderReturnSetting.sendLabel + "";
+
+        var partsListItems = [];
+        var subLineItemRec = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+        subLineItemRec.addQuery('order_summary_key', eolOrderRecord.getValue('sys_id'));
+        subLineItemRec.addQuery('state', 'NOT IN', 'Cancelled,Recovered,Recovered Damaged');
+        subLineItemRec.query();
+
+        while (subLineItemRec.next()) {
+            var serialNumber = subLineItemRec.serial_number;
+            if (subLineItemRec.asset && subLineItemRec.asset.serial_number)
+                serialNumber = subLineItemRec.asset.serial_number + '';
+
+            var partDetails = {
+                "partListItems": {
+                    "EOL": eolOrderRecord.eol_number + "",
+                    "ManName": subLineItemRec.model.manufacturer.name + '',
+                    "ManPartNumber": subLineItemRec.model.model_number + '',
+                    "AssetTag": subLineItemRec.asset_tag + '',
+                    "SerialNumber": serialNumber + '',
+                    "ConfigSequence": subLineItemRec.order_line_key.configuration_sequence_number + '' || '',
+                    "WarehouseLocation": ptpJSON.WarehouseLocation + ''
+                }
+            };
+
+            partsListItems.push(partDetails);
+        }
+
+        ptpJSON.PartList = partsListItems;
+
+        var ctdiJsonBody = {
+            "PartsToBeRecovered": ptpJSON
+        };
+
+        var partsToPickResponse = this._sendRequestToCTDI(ctdiJsonBody, 'PartsToRecover');
+        var responseStatus = partsToPickResponse.getStatusCode() + '';
+        var responseBodyStr = partsToPickResponse.getBody();
+
+        if (!responseStatus.startsWith('2')) {
+            this._createInterventionTask(eolOrderRecord, 'Parts To Be Recovered', responseBodyStr, this._errorASG);
+            return false;
+        } else {
+            return true;
+        }
+    },
+
+    sendRecoverListFromTask: function(taskRecord, location, parts) {
+        if (this._authToken == '') {
+            return false;
+        }
+
+        this._eolSysID = taskRecord.sys_id + '';
+        var ptpJSON = {};
+        ptpJSON.SR = taskRecord.number + '';
+        ptpJSON.SendingSystem = this._sendingSystem + '';
+        ptpJSON.AddressLine1 = location.street_address_line_1 + '';
+        ptpJSON.AddressLine2 = location.street_address_line_2 + '';
+        ptpJSON.Room = "";
+        ptpJSON.City = location.city + '';
+        ptpJSON.CompanyName = location.company_name + '';
+        ptpJSON.ContactName = location.contact_name + '';
+        ptpJSON.ContactPhone = location.contact_phone_number + '';
+        ptpJSON.ContactEmail = location.contact_e_mail + '';
+        ptpJSON.Country = location.country_iso3166_3 + '';
+        ptpJSON.Province = location.province + '';
+        ptpJSON.Zip = location.zip + '';
+        ptpJSON.WarehouseId = location.warehouse + '';
+        ptpJSON.WarehouseLocation = location.stockroom + '';
+        ptpJSON.ServiceLine = '';
+        ptpJSON.Subtype = 'Warehouse Transfer';
+        ptpJSON.SendBox = "false";
+        ptpJSON.SendLabel = "false";
+
+        var partsListItems = [];
+
+        for (var p = 0; p < parts.length; p++) {
+            var partDetails = {
+                "partListItems": {
+                    "ManName": parts[p].manufacturer + '',
+                    "ManPartNumber": parts[p].model_number + '',
+                    "AssetTag": parts[p].asset_tag ? parts[p].asset_tag + '' : '',
+                    "SerialNumber": parts[p].serial_number ? parts[p].serial_number + '' : '',
+                    "ConfigSequence": parts[p].config_sequence + '',
+                    "WarehouseLocation": parts[p].warehouse + ''
+                }
+            };
+
+            partsListItems.push(partDetails);
+        }
+
+        ptpJSON.PartList = partsListItems;
+
+        var ctdiJsonBody = {
+            "PartsToBeRecovered": ptpJSON
+        };
+
+        var partsToPickResponse = this._sendRequestToCTDI(ctdiJsonBody, 'PartsToRecover', 'x_att2_abs_procure_abs_order_task');
+        var responseStatus = partsToPickResponse.getStatusCode() + '';
+        var responseBodyStr = partsToPickResponse.getBody();
+
+        if (!responseStatus.startsWith('2')) {
+            return false;
+        } else {
+            return true;
+        }
+    },
+
+    _getSublineStockroom: function(lineGR) {
+        var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+        subLineGR.addQuery('order_line_key', lineGR.sys_id + "");
+        subLineGR.addNotNullQuery('stockroom');
+        subLineGR.orderBy('sub_line_number');
+        subLineGR.query();
+        if (subLineGR.next()) {
+            return subLineGR.stockroom.stockroom.name.toString().toUpperCase();
+        } else {
+            return '';
+        }
+
+    },
+
+    _getReturnStockroomFromOrder: function(orderGR) {
+        var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+        subLineGR.addQuery('order_summary_key', orderGR.sys_id + "");
+        subLineGR.addNotNullQuery('return_stockroom');
+        subLineGR.orderBy('sub_line_number');
+        subLineGR.query();
+        if (subLineGR.next()) {
+            return subLineGR.return_stockroom.name.toString().toUpperCase();
+        } else {
+            return '';
+        }
+
+    },
+
+    _getWarehouseFromOrder: function(country) {
+        var warehouseMapGR = new GlideRecord('x_att2_abs_procure_warehouse_to_country_map');
+        warehouseMapGR.addEncodedQuery('countryLIKE' + country + '^active=true');
+        warehouseMapGR.query();
+        if (warehouseMapGR.next()) {
+            return warehouseMapGR.ctdi_id + "";
+        }
+        return 'CTDI';
+    },
+
+    _getWarehouseFromCLLI: function(clli) {
+        var warehouseMapGR = new GlideRecord('x_att2_abs_procure_warehouse_to_country_map');
+        warehouseMapGR.addEncodedQuery('clli_code=' + clli + '^active=true');
+        warehouseMapGR.query();
+        if (warehouseMapGR.next()) {
+            return warehouseMapGR.ctdi_id + "";
+        }
+        return 'CTDI';
+    },
+
+    sendAttachmentBase64: function(eolOrderRecord) {
+        this._eolSysID = eolOrderRecord.sys_id + '';
+        var fileList = [];
+        var sysAttUtil = new GlideSysAttachment();
+        var eolAttachmentRecs = sysAttUtil.getAttachments('x_att2_abs_procure_service_request', eolOrderRecord.service_request_number + "");
+        while (eolAttachmentRecs.next()) {
+            var attachmentContentB64 = sysAttUtil.getContentBase64(eolAttachmentRecs);
+            fileList.push({
+                'Base64Data': attachmentContentB64 + '',
+                'FileName': eolOrderRecord.eol_number + '',
+            });
+        }
+        var sendAttRequestBody = {
+            'FileList': fileList
+        };
+
+        var attachmentResponse = this._sendRequestToCTDI(sendAttRequestBody, 'Upload EOL Files to SFTP');
+        var responseStatus = attachmentResponse.getStatusCode() + '';
+        var responseBodyStr = attachmentResponse.getBody();
+
+        if (!responseStatus.startsWith('2')) {
+            this._createInterventionTask(eolOrderRecord, 'Upload EOL Files to SFTP', responseBodyStr, this._errorASG);
+            return false;
+        } else {
+            return true;
+        }
+
+    },
+
+    sendAttachmentMP: function(hostRecord, attachmentGR, logGR) {
+        var commUtil = new ABSPLCommonUtil();
+        var retStatus = false;
+        var eolGR, srGR;
+        if (hostRecord && hostRecord.isValidRecord()) {
+            var hostTable = hostRecord.getTableName();
+            if (hostTable == 'x_att2_abs_procure_service_request') {
+                srGR = hostRecord;
+                eolGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+                eolGR.addQuery('service_request_number', srGR.sys_id + "");
+                eolGR.addQuery('order_type', 'new');
+                eolGR.addQuery('state', 'NOT IN', 'Complete,Cancelled');
+                eolGR.query();
+                if (!eolGR.next())
+                    return false;
+            } else if (hostTable == 'x_att2_abs_procure_abspl_order_summary') {
+                eolGR = hostRecord;
+                srGR = eolGR.service_request_number.getRefRecord();
+                if (!(srGR && srGR.isValidRecord()))
+                    return false;
+            }
+        } else {
+            return false;
+        }
+        try {
+            var mpHelper = new ABSPLMultipartHelper();
+            mpHelper.setHostRecord(hostRecord);
+            mpHelper.addAttachment('file', attachmentGR.sys_id + "");
+
+            // this uses the loopback API to create a multipart-formatted payload.
+            mpHelper.createBody();
+
+            // we create the real rest message, and attach the multipart attachment.
+            var ctdiReq = new sn_ws.RESTMessageV2(this._restMessage, 'Upload EOL Files to SFTP');
+            ctdiReq.setStringParameterNoEscape('ctdiUrl', this._ctdiUrl + '');
+            ctdiReq.setStringParameterNoEscape('token', this._authToken + '');
+            // getContentType returns the content-type string including the boundary
+            // e.g. multipart/form-data; boundary="xxxxxxxxxxxx"
+            ctdiReq.setRequestHeader('Content-Type', mpHelper.getContentType());
+
+            // getBodyId returns the sys_id of the multipart attachment
+            var bodyId = mpHelper.getBodyId();
+            if (bodyId)
+                ctdiReq.setRequestBodyFromAttachment(bodyId);
+
+            var response = ctdiReq.execute();
+
+            var responseStatus = response.getStatusCode();
+            var responseBodyStr = response.getBody();
+        } catch (e) {
+            commUtil.createOrderTask(eolGR, 'Integration Error', 'Investigate a problem while sending a file to CTDI: ' + attachmentGR.file_name, 'The system encountered an error while attempting to send the following file to CTDI: "' + attachmentGR.file_name + '"\nError: ' + (e.message || e), this._errorASG);
+            return false;
+        }
+
+        var requestBodyMessage = {
+            msg: 'Attachment is a binary data stream and cannot be represented here',
+            file_name: attachmentGR.file_name + '',
+            sys_id: attachmentGR.sys_id + ''
+        };
+
+        //Log Integration Details
+        if (logGR && logGR.isValidRecord()) {
+            try {
+                logGR.response_body = JSON.stringify(JSON.parse(responseBodyStr), null, 4);
+            } catch (e) {
+                logGR.response_body = responseBodyStr;
+            }
+            logGR.http_status = responseStatus;
+            logGR.update();
+            retStatus = true;
+        } else {
+            var integrationLog = new x_att2_abs_procure.ABSPLIntegrationLog("CTDI", "Outbound", "REST");
+            integrationLog.setRequest('POST', requestBodyMessage, ctdiReq.getEndpoint(), this._restMessage, 'Upload EOL Files to SFTP', ctdiReq.getRequestHeaders());
+            integrationLog.setResponse(responseBodyStr, responseStatus);
+            integrationLog.setTableInstance(hostTable, hostRecord.sys_id);
+            if (responseStatus.toString().startsWith('2')) {
+                integrationLog.setLogStatus('Processed');
+                retStatus = true;
+            } else {
+                integrationLog.setLogStatus('Error');
+                this._createInterventionTask(eolGR, 'Upload EOL Files to SFTP', responseBodyStr, this._errorASG);
+                retStatus = false;
+            }
+            integrationLog.update();
+        }
+
+        mpHelper.deleteBody();
+
+        return retStatus;
+    },
+
+    sendAllFiles: function(srOrderRecord, eolOrderRecord) {
+        if (!srOrderRecord || !srOrderRecord.isValidRecord()) {
+            gs.addErrorMessage('Service Request not found');
+            return;
+        }
+        var commUtil = new ABSPLCommonUtil();
+        var LOG = [];
+        var retStatus = true;
+        var fileList = ABSPLFileUtil.getSRFileList(srOrderRecord.sys_id + '');
+        var fileIDs = [];
+        for (var i in fileList)
+            fileIDs.push(fileList[i].file_sys_id);
+
+        var eolAttachmentRecs = new GlideRecord('sys_attachment');
+        eolAttachmentRecs.addQuery('sys_id', 'IN', fileIDs);
+        eolAttachmentRecs.query();
+        var numFiles = eolAttachmentRecs.getRowCount();
+
+        LOG.push('Attempting to send ' + numFiles + ' files to CTDI...');
+        while (eolAttachmentRecs.next()) {
+            if (this.sendAttachmentMP(srOrderRecord, eolAttachmentRecs)) {
+                LOG.push(eolAttachmentRecs.file_name + ' (SUCCESS)');
+                for (var j in fileList) {
+                    if (fileList[j].file_sys_id == eolAttachmentRecs.sys_id.toString()) {
+                        fileList[j].sent = true;
+                        break;
+                    }
+                }
+            } else {
+                retStatus = false;
+                LOG.push(eolAttachmentRecs.file_name + ' (ERROR)');
+            }
+        }
+
+        if (numFiles && numFiles > 0) {
+            if (eolOrderRecord && eolOrderRecord.isValidRecord())
+                commUtil.updateProcessingLog(eolOrderRecord, LOG);
+            else
+                gs.addInfoMessage(JSON.stringify(LOG));
+        } else {
+            gs.addErrorMessage('No attachments to send CTDI');
+        }
+
+        srOrderRecord.file_list = JSON.stringify(fileList);
+        srOrderRecord.update();
+
+        return retStatus;
+    },
+
+    sendEOLFiles: function(eolOrderRecord) {
+        var commUtil = new ABSPLCommonUtil();
+        var LOG = [];
+        var retStatus = true;
+        this._eolSysID = eolOrderRecord.sys_id + '';
+        var fileList = ABSPLFileUtil.getSRFileList(eolOrderRecord.service_request_number + '');
+        var fileIDs = [];
+        for (var i in fileList) {
+            if (fileList[i].file_sys_id && fileList[i].eol_number == eolOrderRecord.eol_number.toString())
+                fileIDs.push(fileList[i].file_sys_id);
+        }
+
+        var eolAttachmentRecs = new GlideRecord('sys_attachment');
+        eolAttachmentRecs.addQuery('sys_id', 'IN', fileIDs);
+        eolAttachmentRecs.query();
+        var numFiles = eolAttachmentRecs.getRowCount();
+
+        LOG.push('Attempting to send ' + numFiles + ' files to CTDI...');
+        while (eolAttachmentRecs.next()) {
+            if (this.sendAttachmentMP(eolOrderRecord, eolAttachmentRecs)) {
+                LOG.push(eolAttachmentRecs.file_name + ' (SUCCESS)');
+                for (var j in fileList) {
+                    if (fileList[j].file_sys_id == eolAttachmentRecs.sys_id.toString()) {
+                        fileList[j].sent = true;
+                        break;
+                    }
+                }
+            } else {
+                retStatus = false;
+                LOG.push(eolAttachmentRecs.file_name + ' (ERROR)');
+            }
+        }
+
+        if (numFiles && numFiles > 0)
+            commUtil.updateProcessingLog(eolOrderRecord, LOG);
+        else
+            gs.addErrorMessage('No attachments on this EOL to send CTDI');
+
+        var srGR = eolOrderRecord.service_request_number.getRefRecord();
+        srGR.file_list = JSON.stringify(fileList);
+        srGR.update();
+
+        return retStatus;
+    },
+
+    sendUnsentFiles: function(srOrderRecord, eolOrderRecord) {
+        if (!srOrderRecord || !srOrderRecord.isValidRecord()) {
+            gs.addErrorMessage('Service Request not found');
+            return;
+        }
+
+        var commUtil = new ABSPLCommonUtil();
+        var LOG = [];
+        var retStatus = true;
+        var fileList = ABSPLFileUtil.getSRFileList(srOrderRecord.sys_id + '');
+        var fileIDs = [];
+        for (var i in fileList) {
+            if ((!fileList[i].sent || fileList[i].sent.toString().toLowerCase() != 'true') && fileList[i].file_sys_id)
+                fileIDs.push(fileList[i].file_sys_id);
+        }
+
+        var eolAttachmentRecs = new GlideRecord('sys_attachment');
+        eolAttachmentRecs.addQuery('sys_id', 'IN', fileIDs);
+        eolAttachmentRecs.query();
+        var numFiles = eolAttachmentRecs.getRowCount();
+
+        LOG.push('Attempting to send ' + numFiles + ' files to CTDI...');
+        while (eolAttachmentRecs.next()) {
+            if (this.sendAttachmentMP(srOrderRecord, eolAttachmentRecs)) {
+                LOG.push(eolAttachmentRecs.file_name + ' (SUCCESS)');
+                for (var j in fileList) {
+                    if (fileList[j].file_sys_id == eolAttachmentRecs.sys_id.toString()) {
+                        fileList[j].sent = true;
+                        break;
+                    }
+                }
+            } else {
+                retStatus = false;
+                LOG.push(eolAttachmentRecs.file_name + ' (ERROR)');
+            }
+        }
+
+        if (numFiles && numFiles > 0) {
+            if (eolOrderRecord && eolOrderRecord.isValidRecord())
+                commUtil.updateProcessingLog(eolOrderRecord, LOG);
+            else
+                gs.addInfoMessage(JSON.stringify(LOG));
+        } else {
+            gs.addErrorMessage('No attachments to send CTDI');
+        }
+
+        srOrderRecord.file_list = JSON.stringify(fileList);
+        srOrderRecord.update();
+
+        return retStatus;
+    },
+
+    sendAttachmentUpdate: function(serviceRequestGR, file) {
+        var commUtil = new ABSPLCommonUtil();
+        var eolAttachmentRecs = new GlideSysAttachment().getAttachments('x_att2_abs_procure_service_request', serviceRequestGR.sys_id + "");
+        while (eolAttachmentRecs.next()) {
+            if (eolAttachmentRecs.file_name == serviceRequestGR.getValue(file)) { // file == sdp_file or cfg_file string
+                if (this.sendAttachmentMP(serviceRequestGR, eolAttachmentRecs)) {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+        }
+    },
+
+    _createInterventionTask: function(orderGR, methodName, responseMessage, assignment_group) {
+
+        var taskRec = new GlideRecord('x_att2_abs_procure_abs_order_task');
+        taskRec.initialize();
+        if (orderGR && orderGR.isValidRecord())
+            taskRec.order_summary = orderGR.sys_id + "";
+        taskRec.assignment_group = assignment_group; // ABS Procurement - Procurement Specialists
+        taskRec.short_description = 'CTDI Integration Error - ' + methodName;
+        taskRec.description = "CTDI Integration Error - Received the following response - \n" + responseMessage;
+        taskRec.task_type = 'Integration Error';
+        taskRec.insert();
+        return {
+            number: taskRec.number + '',
+            sys_id: taskRec.sys_id + ''
+        };
+
+    },
+
+    _getReturnSettingForOrder: function(eolRec) {
+        if (eolRec.tech_dispatch == true) {
+            eolRec.processing_log += "\n\nTech Dispatch set to true from Upstream System. Automatically overriding Send box/label to true for CTDI";
+            eolRec.setWorkflow(false);
+            eolRec.update();
+            var retObj = {
+                "sendBox": "true",
+                "sendLabel": "true"
+            };
+        } else {
+            var retObj = {
+                "sendBox": "false",
+                "sendLabel": "false"
+            };
+            // check with service line first
+            var settingsGR = new GlideRecord('x_att2_abs_procure_return_settings');
+            settingsGR.addQuery('service_line', eolRec.service_line + "").addOrCondition('service_line', '');
+            settingsGR.addQuery('country', eolRec.mark_for_country + "");
+            settingsGR.addQuery('subtype', eolRec.subtype);
+            settingsGR.orderByDesc('service_line');
+            settingsGR.query();
+            if (settingsGR.next()) {
+                if (settingsGR.send_box == true)
+                    retObj.sendBox = "true";
+                if (settingsGR.send_label == true)
+                    retObj.sendLabel = "true";
+            }
+        }
+
+        return retObj;
+
+    },
+
+    sendPartsInPo: function(poRec) {
+
+        var warehouseID = '';
+        if (poRec.purchase_requisition.order_summary_key)
+            warehouseID = !poRec.purchase_requisition.order_summary_key.warehouse.nil() ? poRec.purchase_requisition.order_summary_key.warehouse.ctdi_id + "" : this._getWarehouseFromOrder(poRec.purchase_requisition.order_summary_key.mark_for_country + "");
+        else
+            warehouseID = this._getWarehouseFromCLLI(poRec.purchase_requisition.ship_to_clli + "");
+
+        var partsInPoData = {
+            "PartsInPO": {
+                "PONumber": poRec.po_number ? poRec.po_number + '' : '',
+                "SR": poRec.purchase_requisition.order_summary_key.service_request_number.service_request + "",
+                "SendingSystem": this._sendingSystem + '',
+                "Timestamp": new GlideDateTime() + '',
+                "WarehouseID": warehouseID
+            }
+        };
+
+        this._eolSysID = poRec.purchase_requisition.order_summary_key + "";
+        var poAction = "New";
+        if (poRec.po_status == 'Cancelled')
+            poAction = "Cancel";
+
+
+        var partsPoList = [];
+        var partsPoRec = new GlideRecord('x_att2_abs_procure_purchase_requisition_line_item');
+        partsPoRec.addEncodedQuery('purchase_order=' + poRec.sys_id);
+        partsPoRec.query();
+        while (partsPoRec.next()) {
+            var finalQuantity = '';
+            var includePart = true;
+
+            if (partsPoRec.purchase_order.po_version == '1') {
+                finalQuantity = partsPoRec.po_quantity;
+                if (partsPoRec.po_quantity == '0')
+                    includePart = false;
+            } else {
+                var originalOrderQuantity = partsPoRec.quantity;
+                var updatedPoQuantity = partsPoRec.po_quantity;
+                finalQuantity = originalOrderQuantity;
+
+                if (originalOrderQuantity > updatedPoQuantity) {
+                    finalQuantity = originalOrderQuantity - updatedPoQuantity;
+                    poAction = "Cancel";
+                } else if (originalOrderQuantity < updatedPoQuantity) {
+                    finalQuantity = updatedPoQuantity - originalOrderQuantity;
+					poAction = 'New';
+                } else {
+                    includePart = false;
+                }
+            }
+
+            if (includePart) {
+                partsPoList.push({
+                    "partListItems": {
+                        "Action": poAction + '',
+                        "ManAltPartNum": partsPoRec.model.model_number + '' || '',
+                        "ManName": partsPoRec.model.manufacturer.name + '' || '',
+                        "ManPartNumber": partsPoRec.model.model_number + '' || '',
+                        "Quantity": finalQuantity + '' || 0,
+                        "SupplierName": partsPoRec.supplier_key + '' || '',
+                        "ConfigSequence": partsPoRec.eol_line_config_sequence_number + '' || '',
+                        "WarehouseLocation": partsPoRec.stockroom.name.toString().toUpperCase() || '',
+                    }
+                });
+            }
+        }
+
+        // Adds the parts list to the PO
+        if (partsPoList.length > 0) {
+            partsInPoData.PartsInPO.PartList = partsPoList;
+
+            var partsInPoResponse = this._sendRequestToCTDI(partsInPoData, 'PartsInPO');
+            var responseStatus = partsInPoResponse.getStatusCode() + '';
+            var responseBodyStr = partsInPoResponse.getBody();
+
+            if (!responseStatus.startsWith('2')) {
+                var orderSumRec = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+                orderSumRec.get(this._eolSysID);
+                this._createInterventionTask(orderSumRec, 'PartsInPO', responseBodyStr, this._errorASG);
+                return false;
+            } else {
+                return true;
+            }
+        }
+    },
+
+    _sendRequestToCTDI: function(jsonBody, methodName, tableName) {
+        if (!tableName)
+            tableName = 'x_att2_abs_procure_abspl_order_summary';
+
+        try {
+            var ctdiReq = new sn_ws.RESTMessageV2(this._restMessage, methodName);
+            ctdiReq.setStringParameterNoEscape('ctdiUrl', this._ctdiUrl + '');
+            ctdiReq.setStringParameterNoEscape("token", this._authToken + '');
+            ctdiReq.setRequestBody(JSON.stringify(jsonBody)); //Log Integration Details
+
+            var integrationLog = new x_att2_abs_procure.ABSPLIntegrationLog("CTDI", "Outbound", "REST");
+            integrationLog.setTableInstance(tableName, this._eolSysID);
+
+            var response = ctdiReq.execute();
+            var responseStatus = response.getStatusCode();
+            var responseBodyStr = response.getBody();
+        } catch (e) {
+            gs.error("Error sending REST to CTDI\n --> " + e);
+        }
+
+        integrationLog.setRequest('POST', jsonBody, ctdiReq.getEndpoint(), this._restMessage, methodName, ctdiReq.getRequestHeaders());
+        integrationLog.setResponse(responseBodyStr, responseStatus);
+        if (responseStatus.toString().startsWith('2'))
+            integrationLog.setLogStatus('Processed');
+        else
+            integrationLog.setLogStatus('Error');
+        integrationLog.update();
+
+        return response;
+    },
+
+    _getCtdiConnectionInfo: function() {
+
+        var instanceType = new ABSPLCommonUtil().getInstanceType();
+        var appCfg = new ABSPLAppConfig('CTDI');
+
+        if (instanceType == 'PROD') {
+            return {
+                'username': appCfg.getParameter('username'),
+                'password': appCfg.getParameter('password'),
+                'url': appCfg.getParameter('base_url')
+            };
+        } else if (instanceType == 'TEST') {
+            return {
+                'username': appCfg.getParameter('username_test'),
+                'password': appCfg.getParameter('password_test'),
+                'url': appCfg.getParameter('base_url_test')
+            };
+        } else {
+            return {
+                'username': appCfg.getParameter('username_dev'),
+                'password': appCfg.getParameter('password_dev'),
+                'url': appCfg.getParameter('base_url_dev')
+            };
+        }
+    },
+
+    getToken: function() {
+        return this._authToken;
+    },
+
+    _getToken: function(ctdiConnectionInfo) {
+        try {
+            var tokenReq = new sn_ws.RESTMessageV2(this._restMessage, 'Get Token');
+            tokenReq.setStringParameterNoEscape('ctdiUrl', ctdiConnectionInfo.url);
+            tokenReq.setStringParameterNoEscape('username', ctdiConnectionInfo.username);
+            tokenReq.setStringParameterNoEscape('password', ctdiConnectionInfo.password);
+            var tokenResponse = tokenReq.execute();
+            var responseStatus = tokenResponse.getStatusCode();
+            var responseBodyStr = tokenResponse.getBody();
+        } catch (e) {
+            gs.error("Error getting authentication token for CTDI connection\n --> " + e);
+        }
+
+        if (responseStatus != '200') {
+            return false;
+        }
+
+        var responseBody = JSON.parse(responseBodyStr);
+        var ctdiToken = responseBody.access_token + '';
+        return ctdiToken;
+    },
+
+    type: 'ABSPLCTDIIntegration'
+};
+
+ABSPLCTDIIntegration.processShippingUpdates = function( /*RESTAPIRequest*/ request, /*RESTAPIResponse*/ response) {
+    var NO_ERR_STATES = ['PROCHOLD'];
+    var requestData = request.body.data;
+
+    //Log Integration Details
+    var integrationLog = new x_att2_abs_procure.ABSPLIntegrationLog('CTDI', "Inbound", "REST");
+    integrationLog.setRequest('POST', JSON.stringify(requestData), request.url, 'ABSPLCTDIIntegration', 'processShippingUpdates', request.headers);
+
+    var commUtil = new ABSPLCommonUtil();
+    var serviceRequest = requestData.SR + '';
+    var ctdiState = requestData.Status.toString().toUpperCase().trim();
+    var responseStatus = 'Success';
+    var responseMsg = '';
+    var responseCode = '200';
+    var currentState = '';
+    if (ctdiState == "PICKED")
+        currentState = 'Picking';
+    if (ctdiState == "STAGED")
+        currentState = 'Staging';
+    if (ctdiState == "SHIPPED")
+        currentState = 'Shipping';
+    if (ctdiState == "CANCELLED")
+        currentState = 'Cancelled';
+
+    var holdSubStates = ["Staging Hold", "International Hold", "Procurement Hold"];
+
+    // Line Item Validations (but not for international or staging hold statuses)
+    if (responseStatus == 'Success' && ctdiState != "INTHOLD" && ctdiState != "STGHOLD") {
+        var partsListCount = 0;
+        var partsListShipped = requestData.PartListShipped;
+        //var sublineCount = getSublineCount(orderSummaryRec.sys_id + "");
+        for (var i in partsListShipped) {
+            partsListCount += parseInt(partsListShipped[i]["Quantity"]);
+        }
+        // if (sublineCount != partsListCount) {
+        //     responseCode = "400";
+        //     responseStatus = 'Error';
+        //     responseMsg += "\nNumber of parts sent (" + partsListShipped.length + ") does not match the sub-line items ServiceNow has (" + sublineCount + ")";
+        // } else {
+        for (var listIdx = 0; listIdx < partsListShipped.length; listIdx++) {
+            var partData = partsListShipped[listIdx];
+            var eolOrderNumber = partData.EOL + '';
+            var partNumber = partData.ManPartNumber + '';
+            var serialNumber = partData.SerialNumber + '';
+            var assetTag = partData.AssetTag + '';
+            var origSerialNumber = partData.OrigSerialNumber + '';
+            var orderSummaryRec = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+            orderSummaryRec.addQuery('eol_number', eolOrderNumber);
+            orderSummaryRec.query();
+            if (orderSummaryRec.next()) {
+                integrationLog.setTableInstance('x_att2_abs_procure_abspl_order_summary', orderSummaryRec.sys_id);
+
+                var misMatchState = false;
+                if (ctdiState == 'PICKED' && orderSummaryRec.substate != 'Picking' && holdSubStates.indexOf(orderSummaryRec.substate + "") == -1)
+                    misMatchState = true;
+                if (ctdiState == 'STAGED' && orderSummaryRec.substate != 'Staging' && holdSubStates.indexOf(orderSummaryRec.substate + "") == -1)
+                    misMatchState = true;
+                if (ctdiState == 'PROCHOLD' && (!(['Picking', 'Staging']).includes(orderSummaryRec.substate + '')))
+                    misMatchState = true;
+                if (ctdiState == 'STGHOLD' && orderSummaryRec.substate != 'Staging')
+                    misMatchState = true;
+                // if (ctdiState == 'REPLACED' && orderSummaryRec.state != ')
+                //     misMatchState = true;
+                if (ctdiState == 'SHIPPED' && orderSummaryRec.substate != 'Shipping' && orderSummaryRec.substate.toString() != 'Pending Activation' && orderSummaryRec.substate != 'Under Review' && holdSubStates.indexOf(orderSummaryRec.substate + "") == -1)
+                    misMatchState = true;
+                if (misMatchState) {
+                    responseCode = '400';
+                    responseStatus = 'Error';
+                    responseMsg = "Cannot process " + ctdiState + ", EOL is not pending that status";
+                }
+                if (!isValidDate(requestData.ShipDate + "")) {
+                    responseCode = '400';
+                    responseStatus = 'Error';
+                    responseMsg = "Cannot process ship date " + requestData.ShipDate + ", not a valid date. Acceptable date format is as follows YYYY-MM-DD.";
+                }
+
+                if (ctdiState == "NON-DELIVERABLE") {
+                    new ABSPLOrderStateFlow(orderSummaryRec).updateOrderState('Pending CTDI', 'Under Review');
+
+                    var nonD_deadline = new GlideDate();
+                    nonD_deadline.addDaysUTC(30);
+                    var nonD_short_description = 'Investigate ' + ctdiState + ' update received from CTDI for EOL ' + eolOrderNumber;
+                    var nonD_description = 'CTDI has reported a status of ' + ctdiState + ' for this EOL. Investigate and resolve this issue, or cancel the EOL upstream. A new SHIPPED feed must be received from CTDI or CANCEL received from ' + orderSummaryRec.sending_system + ' by ' + nonD_deadline + '.';
+                    var orderTasksGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+                    orderTasksGR.addQuery('order_summary', orderSummaryRec.sys_id);
+                    orderTasksGR.addQuery('task_type', 'Other');
+                    orderTasksGR.addQuery('short_description', nonD_short_description);
+                    orderTasksGR.addQuery('active', 'true');
+                    orderTasksGR.query();
+                    if (!orderTasksGR.hasNext())
+                        commUtil.createOrderTask(orderSummaryRec, 'Other', nonD_short_description, nonD_description, '59cf516493ff8ad44c18f8f17cba1016' /* ASG-ABSPL-Staging Specialist */ );
+                }
+
+            } else {
+                // Make sure we have a number to reference
+                if (!(eolOrderNumber && eolOrderNumber.startsWith('ORT'))) {
+                    responseCode = '400';
+                    responseStatus = 'Error';
+                    responseMsg = eolOrderNumber ? "Stockroom Move task " + eolOrderNumber + " not found in ServiceNow" : "EOL value missing from payload for " + partNumber;
+                    continue;
+                }
+
+                // If this is in response to a Stockroom Move task (no EOL)
+                var orderTaskRec = new GlideRecord('x_att2_abs_procure_abs_order_task');
+                orderTaskRec.addQuery('number', eolOrderNumber);
+                orderTaskRec.query();
+                if (orderTaskRec.next()) {
+                    processShippingUpdatesTask(request, response, orderTaskRec, integrationLog);
+                    return;
+                } else {
+                    responseCode = '400';
+                    responseStatus = 'Error';
+                    responseMsg = "EOL " + eolOrderNumber + " not found in ServiceNow";
+                    continue;
+                }
+            }
+
+            if (responseStatus == 'Success') {
+                if (ctdiState == "PICKED" || (ctdiState == "STAGED" && origSerialNumber != serialNumber && origSerialNumber != "")) {
+                    var assetCheck = checkAssetAvailability(partNumber, serialNumber, assetTag);
+                    if (assetCheck != "") {
+                        responseCode = "400";
+                        responseStatus = 'Error';
+                        responseMsg += "\nError on part " + partNumber + " with serial number " + serialNumber + ": " + assetCheck;
+                    }
+                }
+                var partcheck = checkLineParts(partNumber, orderSummaryRec.sys_id + "", ctdiState);
+                if (!partcheck) {
+                    responseCode = "400";
+                    responseStatus = 'Error';
+                    responseMsg += "\nError on part " + partNumber + ". No line items require that part on " + orderSummaryRec.eol_number;
+                }
+                // check to make sure we have a matching subline for the serial number and error if not
+                var eolSubLineItemRec = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+				if(orderSummaryRec.substate.toString() == "Pending Activation")
+					currentState = 'Shipped';
+                if (currentState != '' && currentState != "Cancelled" && orderSummaryRec.substate.toString() != "Under Review")
+                    eolSubLineItemRec.addQuery('state', currentState);
+                eolSubLineItemRec.addQuery('order_summary_key.eol_number', eolOrderNumber);
+                eolSubLineItemRec.addQuery('order_line_key.model.model_number', partNumber);
+                if (origSerialNumber != "" && (ctdiState == "STAGED" || ctdiState == "REPLACED")) {
+                    eolSubLineItemRec.addQuery('serial_number', origSerialNumber).addOrCondition('serial_number', '');
+                } else {
+                    eolSubLineItemRec.addQuery('serial_number', serialNumber).addOrCondition('serial_number', '');
+                }
+                eolSubLineItemRec.orderBy('order_line_key.configuration_sequence_number');
+                eolSubLineItemRec.query();
+
+                if (!eolSubLineItemRec.hasNext()) {
+                    responseCode = "400";
+                    responseStatus = 'Error';
+                    responseMsg += "\nError on Serial Number \"" + serialNumber + "\". No lines match up with this serial number or the original serial number of \"" + origSerialNumber + "\"";
+                }
+                // }
+            }
+        }
+        responseMsg = responseMsg.trim();
+    }
+
+    if (responseStatus == 'Success') {
+        if (ctdiState != "INTHOLD" && ctdiState != "STGHOLD") {
+            if (ctdiState == "PROCHOLD") {
+                // create procurement task
+                var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+                taskGR.initialize();
+                taskGR.order_summary = orderSummaryRec.sys_id + "";
+                taskGR.assignment_group = '346fd9e093ff8ad44c18f8f17cba1039'; // ABS Procurement - Procurement Specialists
+                taskGR.short_description = "Out of stock items on order.";
+                taskGR.description = "Out of stock items:";
+                //taskGR.description += "\n  - " + current.sub_line_number + ': ' + current.model.name;
+                var taskId = taskGR.insert();
+                taskGRUpdate = new GlideRecord('x_att2_abs_procure_abs_order_task');
+                taskGRUpdate.get(taskId + "");
+            }
+            responseMsg = 'Update Successful';
+            // TODO: No need to redefine partsListShipped here. Rework this to iterate through a single gliderecord query on sub line items instead, then loop through partsListShipped looking for each line's parts. -SC
+
+            var partsListShipped2 = requestData.PartListShipped;
+            for (var listIdx2 = 0; listIdx2 < partsListShipped2.length; listIdx2++) {
+                var partData = partsListShipped2[listIdx2];
+                var eolOrderNumber = partData.EOL + '';
+                var partNumber = partData.ManPartNumber + '';
+                var serialNumber = partData.SerialNumber + '';
+                var origSerialNumber = partData.OrigSerialNumber + '';
+                var quantity = parseInt(partData.Quantity + '');
+
+                var eolSubLineItemRec = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+                if (currentState != '' && currentState != "Cancelled" && orderSummaryRec.substate.toString() != "Under Review")
+                    eolSubLineItemRec.addQuery('state', currentState);
+                eolSubLineItemRec.addQuery('order_summary_key.eol_number', eolOrderNumber);
+                eolSubLineItemRec.addQuery('order_line_key.model.model_number', partNumber);
+                if (origSerialNumber != "" && (ctdiState == "PICKED" || ctdiState == "STAGED" || ctdiState == "REPLACED")) {
+                    eolSubLineItemRec.addQuery('serial_number', origSerialNumber).addOrCondition('serial_number', '');
+                } else {
+                    eolSubLineItemRec.addQuery('serial_number', serialNumber).addOrCondition('serial_number', '');
+                }
+                eolSubLineItemRec.orderBy('sys_updated_on'); // get the oldest record in cases of multiple matching lines, so we don't grab those we just updated
+                eolSubLineItemRec.query();
+
+                // Do it for all in quantity
+                var quantityCounter = 0;
+
+                while (eolSubLineItemRec.next() && quantityCounter < quantity) {
+                    quantityCounter++;
+
+                    if (origSerialNumber != '' && origSerialNumber != serialNumber) {
+                        // unreserve the old asset
+                        // set to 'reuse' if not defective
+                        //getAsset(partNumber, origSerialNumber, 'reuse');
+
+                        // if defective, set to defective -- directed to always assume defective in this case
+                        getAsset(eolSubLineItemRec.model + "", origSerialNumber, 'defective', eolSubLineItemRec.stockroom.stockroom + "");
+                    }
+                    if (ctdiState == 'PICKED')
+                        eolSubLineItemRec.state = 'Picked';
+                    if (ctdiState == 'STAGED')
+                        eolSubLineItemRec.state = 'Staged';
+                    // if (ctdiState == 'REPLACED')
+                    //     eolSubLineItemRec.state = ''; //Do nothing
+                    if (ctdiState == 'SHIPPED')
+                        eolSubLineItemRec.state = 'Shipped';
+                    if (ctdiState == 'PROCHOLD')
+                        eolSubLineItemRec.state = 'Procurement Hold';
+
+                    if (ctdiState == "CANCELLED") {
+                        //unreserveAsset(eolSubLineItemRec, serialNumber);
+                        eolSubLineItemRec.state = "Cancelled";
+                        eolSubLineItemRec.stockroom = '';
+                        eolSubLineItemRec.asset = '';
+                        eolSubLineItemRec.serial_number = '';
+                        eolSubLineItemRec.asset_tag = '';
+                    } else {
+                        eolSubLineItemRec.asset = getAsset(eolSubLineItemRec.model + "", serialNumber, 'reserved', eolSubLineItemRec.stockroom.stockroom + "");
+                    }
+                    eolSubLineItemRec.serial_number = partData.SerialNumber || '';
+                    eolSubLineItemRec.asset_tag = partData.AssetTag || '';
+                    eolSubLineItemRec.tracking_number = requestData.TrackingNumber || '';
+                    eolSubLineItemRec.country_of_origin = partData.CountryOfOrigin || '';
+                    eolSubLineItemRec.hazmat = partData.Hazmat.toString().toLowerCase() == 'y';
+                    eolSubLineItemRec.net_weight_lb = partData.NetWeightLB || '';
+                    eolSubLineItemRec.net_weight_kg = partData.NetWeightKG || '';
+                    eolSubLineItemRec.gross_weight_lb = partData.GrossWeightLB || '';
+                    eolSubLineItemRec.gross_weight_kg = partData.GrossWeightKG || '';
+                    eolSubLineItemRec.shipping_carrier = requestData.Shipper || '';
+                    eolSubLineItemRec.shipping_date = setDateFromString(requestData.ShipDate + '');
+                    eolSubLineItemRec.update();
+
+                    if (ctdiState == "PROCHOLD") {
+                        if (eolSubLineItemRec.order_line_key.configuration_sequence_number.toString().startsWith('1')) {
+                            var procholdSubLineItems = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+                            procholdSubLineItems.addQuery('order_summary_key.eol_number', eolOrderNumber);
+                            procholdSubLineItems.addQuery('order_line_key.configuration_sequence_number', 'STARTSWITH', '1');
+                            procholdSubLineItems.orderBy('order_line_key.configuration_sequence_number');
+                            procholdSubLineItems.query();
+                            while (procholdSubLineItems.next()) {
+                                procholdSubLineItems.state = 'Procurement Hold';
+                                procholdSubLineItems.update();
+
+                                taskGRUpdate.description += "\n  - " + procholdSubLineItems.sub_line_number + ': ' + procholdSubLineItems.model.name;
+                                taskGRUpdate.update();
+                            }
+                        } else {
+                            taskGRUpdate.description += "\n  - " + eolSubLineItemRec.sub_line_number + ': ' + eolSubLineItemRec.model.name;
+                            taskGRUpdate.update();
+                        }
+                    }
+                }
+            }
+        }
+
+        if (ctdiState == 'STGHOLD' || ctdiState == 'INTHOLD') {
+            var serviceRequestGR = new GlideRecord('x_att2_abs_procure_service_request');
+            if (serviceRequestGR.get('service_request', serviceRequest)) {
+                integrationLog.setTableInstance('x_att2_abs_procure_service_request', serviceRequestGR.sys_id + "");
+                // Update all EOLs associated to the SR that went into CTDI Hold
+                var orderSummaryRec = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+                orderSummaryRec.addQuery('service_request_number', serviceRequestGR.sys_id + "");
+                orderSummaryRec.query();
+                while (orderSummaryRec.next()) {
+                    if (orderSummaryRec.state == "Pending CTDI") {
+                        if (ctdiState == 'STGHOLD')
+                            new ABSPLOrderStateFlow(orderSummaryRec).updateOrderState('Pending CTDI', 'Staging Hold');
+                        else if (ctdiState == 'INTHOLD')
+                            new ABSPLOrderStateFlow(orderSummaryRec).updateOrderState('Pending CTDI', 'International Hold');
+                    }
+                    for (var p in requestData.PartListShipped) {
+                        if (orderSummaryRec.eol_number.toString() == requestData.PartListShipped[p].EOL)
+                            commUtil.updateProcessingLog(orderSummaryRec, ctdiState + ' successfully processed from CTDI');
+                    }
+                }
+            }
+        } else if (ctdiState == 'PROCHOLD') {
+            new ABSPLOrderStateFlow(orderSummaryRec).updateOrderState('Open', 'Procurement Hold');
+            commUtil.updateProcessingLog(orderSummaryRec, ctdiState + ' successfully processed from CTDI');
+        } else if (ctdiState == "CANCELLED") {
+            new ABSPLOrderStateFlow(orderSummaryRec).updateOrderState('Cancelled', 'Cancelled');
+            commUtil.updateProcessingLog(orderSummaryRec, ctdiState + ' successfully processed from CTDI');
+        } else if (ctdiState == "SHIPPED" && orderSummaryRec.state == "Pending Cancellation") {
+            // If CTDI already shipped this order while we received a cancellation, then we need to generate a return of the equipment and cancel this order.
+            var orgStageOrder = new GlideRecord('x_att2_abs_procure_stage_order_summary');
+            orgStageOrder.addEncodedQuery('processing_status=Processed^order_type=New^eol_number=' + orderSummaryRec.eol_number + '');
+            orgStageOrder.query();
+
+            if (orgStageOrder.next()) {
+                var modifiedPayload = JSON.parse(orgStageOrder.payload);
+                //modifiedPayload.EOLNumber += '-RL';
+                modifiedPayload.OrderType = 'Return';
+                modifiedPayload.OrderSubType = 'Cancel';
+                modifiedPayload.SuppressUpstreamMessages = 'true';
+
+                for (var i = 0; i < modifiedPayload.LineItems.length; i++) {
+                    modifiedPayload.LineItems[i].LineItemAction = 'Return';
+                }
+
+                var stageOrder = new GlideRecord('x_att2_abs_procure_stage_order_summary');
+                stageOrder.initialize();
+                stageOrder.payload = JSON.stringify(modifiedPayload);
+                stageOrder.eol_number = modifiedPayload.EOLNumber;
+                stageOrder.order_type = modifiedPayload.OrderType;
+                stageOrder.subtype = modifiedPayload.OrderSubType;
+                stageOrder.processing_status = 'Inserted';
+                stageOrder.processing_log = "EOL Payload Received -- Cancel during Shipping -- " + new GlideDateTime() + " (GMT)";
+                stageOrder.insert();
+
+                new ABSPLOrderStateFlow(orderSummaryRec).updateOrderState('Cancelled', 'Cancelled');
+                commUtil.updateProcessingLog(orderSummaryRec, [ctdiState + ' successfully processed from CTDI', 'This Order had received a Cancel from upstream system, and will be marked Cancelled and a Return Order has been created to get the parts back']);
+            }
+        } else {
+            orderSummaryRec.tracking_number = requestData.TrackingNumber || "";
+            orderSummaryRec.shipper = requestData.Shipper || "";
+            orderSummaryRec.mode_of_transport = requestData.ModeOfTransport || "";
+            orderSummaryRec.total_packages = requestData.TotalPackages || "";
+            orderSummaryRec.total_pallets = requestData.TotalPallets || "";
+            orderSummaryRec.gross_weight_lb = requestData.GrossWeightLB || "";
+            orderSummaryRec.gross_weight_kg = requestData.GrossWeightKG || "";
+            orderSummaryRec.staging_cost = requestData.StagingCost || "";
+            orderSummaryRec.ship_date = setDateFromString(requestData.ShipDate + "");
+            commUtil.updateProcessingLog(orderSummaryRec, ctdiState + ' successfully processed from CTDI');
+            if (ctdiState == "SHIPPED" && orderSummaryRec.substate.toString() == 'Under Review')
+                new ABSPLOrderStateFlow(orderSummaryRec).updateOrderState('Shipped', 'Pending Activation');
+            orderSummaryRec.setWorkflow(false);
+            orderSummaryRec.update();
+        }
+    }
+
+    if (responseStatus != 'Success' && NO_ERR_STATES.includes(ctdiState)) {
+        if (orderSummaryRec && orderSummaryRec.isValidRecord()) {
+            commUtil.createOrderTask(orderSummaryRec, 'Integration Error', 'Error on ' + ctdiState + ' update from CTDI', responseCode + ': ' + responseMsg, '3df59c34eb5156901c75fd77cad0cd5d' /* ABSPL Admin */ );
+        }
+        responseCode = "200";
+        responseStatus = "Success";
+        responseMsg = "Update successful (with warnings)";
+    }
+
+    // Set Response body
+    var respObj = {};
+    respObj.platform = "ServiceNow";
+    respObj.datetime = new GlideDateTime().getValue() + '';
+    respObj.status = responseStatus;
+    respObj.msg = responseMsg;
+
+    response.setBody(respObj);
+    response.setStatus(responseCode);
+
+    integrationLog.setResponse(JSON.stringify(respObj), responseCode);
+    if (responseStatus == 'Success')
+        integrationLog.setLogStatus('Processed');
+    else
+        integrationLog.setLogStatus('Error');
+    integrationLog.update();
+
+
+    function processShippingUpdatesTask(request, response, taskRecord, integrationLog) {
+        var requestData = request.body.data;
+        var notes = [];
+
+        var ctdiState = requestData.Status.toString().toUpperCase().trim();
+        var responseStatus = 'Success';
+        var responseMsg = '';
+        var responseCode = '200';
+
+        integrationLog.setTableInstance('x_att2_abs_procure_abs_order_task', taskRecord.sys_id);
+
+        if (!taskRecord.active) {
+            responseCode = '400';
+            responseStatus = 'Error';
+            responseMsg = "Cannot process " + ctdiState + ", EOL is not pending that status";
+        }
+
+        // Line Item Validations
+        if (responseStatus == 'Success') {
+            var partsListShipped = requestData.PartListShipped;
+            for (var listIdx = 0; listIdx < partsListShipped.length; listIdx++) {
+                var partData = partsListShipped[listIdx];
+                var partNumber = partData.ManPartNumber + '';
+                var serialNumber = partData.SerialNumber + '';
+                var assetTag = partData.AssetTag + '';
+                var manufacturer = partData.Manufacturer + '';
+
+                var origSerialNumber = partData.OrigSerialNumber + '';
+                if (ctdiState == "PICKED" || (ctdiState == "STAGED" && origSerialNumber != serialNumber && origSerialNumber != "")) {
+                    var assetCheck = checkAssetAvailability(partNumber, serialNumber, assetTag);
+                    if (assetCheck != "") {
+                        responseCode = "400";
+                        responseStatus = 'Error';
+                        responseMsg += "\nError on part " + partNumber + " with serial number " + serialNumber + ": " + assetCheck;
+                        notes.push('Error on part ' + partNumber + ' with serial umber ' + serialNumber + ': ' + assetCheck);
+                    }
+                }
+                var partcheck = checkLinePartsTask(partNumber, taskRecord);
+                if (!partcheck) {
+                    responseCode = "400";
+                    responseStatus = 'Error';
+                    responseMsg += "\nError on part " + partNumber + ". No line items require that part on " + taskRecord.number;
+                    notes.push("Error on part " + partNumber + ". No line items require that part on " + taskRecord.number);
+                }
+            }
+            responseMsg = responseMsg.trim();
+        }
+
+        if (responseStatus == 'Success') {
+            responseMsg = 'Update Successful';
+            var partsListShipped2 = requestData.PartListShipped;
+            var partsList = commUtil.isJsonString(taskRecord.variables.parts_to_move) ? JSON.parse(taskRecord.variables.parts_to_move) : [];
+            var updatedPartsList = commUtil.isJsonString(taskRecord.variables.parts_moved) ? JSON.parse(taskRecord.variables.parts_moved) : [];
+
+            for (var listIdx2 = 0; listIdx2 < partsListShipped2.length; listIdx2++) {
+                var partData = partsListShipped2[listIdx2];
+                var partNumber = partData.ManPartNumber + '';
+                var serialNumber = partData.SerialNumber + '';
+                var origSerialNumber = partData.OrigSerialNumber + '';
+                var quantity = partData.Quantity + '';
+
+                var model_id = '';
+                var found = false;
+                var config_seq = '';
+                var consumable = false;
+
+                for (var p = 0; p < partsList.length; p++) {
+                    var modelGR = new GlideRecord('cmdb_model');
+                    modelGR.get(partsList[p].part_number);
+                    if (modelGR.model_number == partNumber) {
+                        model_id = partsList[p].part_number + "";
+                        config_seq = partsList[p].config_sequence + "";
+                        if (modelGR.sys_class_name == "cmdb_consumable_product_model") {
+                            consumable = true;
+                        }
+                    }
+                }
+                if (!serialNumber) {
+                    for (var l = 0; l < updatedPartsList.length; l++) {
+                        var modelGR = new GlideRecord('cmdb_model');
+                        modelGR.get(updatedPartsList[l].model);
+                        if (modelGR.model_number == partNumber) {
+                            found = true;
+                            if (ctdiState == "PICKED") {
+                                var quantityInt = parseInt(updatedPartsList[l].quantity_picked, 10) + parseInt(quantity, 10);
+                                updatedPartsList[l].quantity_picked = quantityInt.toString();
+                            } else {
+                                if (!(['RECOVERED', 'RECOVERED WRONG STOCKROOM']).includes(updatedPartsList[l].status))
+                                    updatedPartsList[l].status = ctdiState;
+                            }
+                        }
+                    }
+
+                } else {
+                    //Check against any parts already picked
+                    for (var l = 0; l < updatedPartsList.length; l++) {
+                        var modelGR = new GlideRecord('cmdb_model');
+                        modelGR.get(updatedPartsList[l].model);
+                        if (modelGR.model_number == partNumber && updatedPartsList[l].serial_number == serialNumber) {
+                            found = true;
+                            updatedPartsList[l].status = ctdiState;
+                        }
+                    }
+                }
+
+                if (!found) {
+                    var asset = '';
+                    if (consumable) {
+                        var consumableGR = new GlideRecord('alm_consumable');
+                        consumableGR.addQuery('model', model_id);
+                        consumableGR.addQuery('stockroom', taskRecord.variables.move_to);
+                        consumableGR.query();
+                        if (consumableGR.next()) {
+                            asset = consumableGR.sys_id + "";
+                        } else {
+                            createAssetGR = new GlideRecord('alm_consumable');
+                            createAssetGR.initialize();
+                            createAssetGR.u_skipcreatecibr = true;
+                            createAssetGR.model = model_id;
+                            createAssetGR.stockroom = taskRecord.variables.move_to;
+                            createAssetGR.quantity = parseInt(quantity, 10);
+                            createAssetGR.install_status = '6';
+                            createAssetGR.substatus = 'available';
+                            asset = createAssetGR.insert();
+                        }
+                    } else {
+                        asset = getAsset(model_id + "", serialNumber, 'reserved');
+                    }
+                    var newPart = {};
+                    newPart.model = model_id;
+                    newPart.asset_tag = partData.AssetTag || '';
+                    newPart.serial_number = partData.SerialNumber || '';
+                    newPart.asset = asset;
+                    newPart.status = ctdiState;
+                    newPart.config_sequence_picked = config_seq + '';
+                    newPart.quantity_picked = quantity;
+                    newPart.quantity_received = '0';
+                    updatedPartsList.push(newPart);
+                }
+            }
+
+            if (ctdiState == 'SHIPPED') {
+                if (requestData.TrackingNumber) notes.push('Tracking Number: ' + requestData.TrackingNumber);
+                if (requestData.Shipper) notes.push('Shipper: ' + requestData.Shipper);
+            }
+
+            taskRecord.variables.parts_moved = JSON.stringify(updatedPartsList);
+            var notesTop = ctdiState + ' status processed from CTDI.';
+            if (notes.length) notesTop = notesTop + '\n' + notes.join('\n');
+
+            if (ctdiState == 'SHIPPED') {
+                //Send recover list to CTDI
+                var obj = new ABSPLStockroomMove().getRecoverDataFromTask(taskRecord);
+                var recoverResponse = new ABSPLCTDIIntegration().sendRecoverListFromTask(taskRecord, obj.location, obj.parts);
+                if (recoverResponse) {
+                    notesTop = notesTop + '\n\nCTDI has been sent the parts to recover successfully.';
+                    for (var j = 0; j < updatedPartsList.length; j++) {
+                        if (updatedPartsList[j].status == 'SHIPPED')
+                            updatedPartsList[j].status = 'PENDING RECOVER';
+                    }
+                    taskRecord.variables.parts_moved = JSON.stringify(updatedPartsList);
+                } else {
+                    notesTop = notesTop + '\n\nThere was an error sending CTDI the parts to recover.';
+                    if (!taskRecord.assigned_to) taskRecord.assigned_to = taskRecord.opened_by + '';
+                    taskRecord.state = -5; //Pending
+                }
+            }
+
+            taskRecord.work_notes = notesTop;
+            taskRecord.update();
+        } else {
+            var notesTop = ctdiState + ' status processed from CTDI.';
+            if (notes.length) notesTop = notesTop + '\n' + notes.join('\n');
+            taskRecord.work_notes = notesTop;
+            if (!taskRecord.assigned_to) taskRecord.assigned_to = taskRecord.opened_by + '';
+            taskRecord.state = -5; //Pending
+            taskRecord.update();
+        }
+
+        // Set Response body
+        var respObj = {};
+        respObj.platform = "ServiceNow";
+        respObj.datetime = new GlideDateTime().getValue() + '';
+        respObj.status = responseStatus;
+        respObj.msg = responseMsg;
+
+        response.setBody(respObj);
+        response.setStatus(responseCode);
+
+        integrationLog.setResponse(JSON.stringify(respObj), responseCode);
+        if (responseStatus == 'Success')
+            integrationLog.setLogStatus('Processed');
+        else
+            integrationLog.setLogStatus('Error');
+        integrationLog.update();
+    }
+
+    function checkAssetAvailability(partNumber, serialNumber, assetTag) {
+        var consumableGR = new GlideRecord('alm_consumable');
+        consumableGR.addQuery('model.model_number', partNumber);
+        //consumableGR.addQuery('model.x_att2_abs_procure_u_abspl', true);
+        consumableGR.query();
+        if (!consumableGR.hasNext()) {
+            var softwareGR = new GlideRecord('alm_license');
+            softwareGR.addQuery('model.model_number', partNumber);
+            softwareGR.addQuery('software_model.edition', 'ABSPL');
+            softwareGR.query();
+            if (!softwareGR.hasNext()) {
+                var assetGR = new GlideRecord('alm_asset');
+                assetGR.addQuery('model.model_number', partNumber);
+                //assetGR.addQuery('model.x_att2_abs_procure_u_abspl', true);
+                //assetGR.addQuery('asset_tag', assetTag);
+                assetGR.addQuery('serial_number', serialNumber);
+                assetGR.query();
+                if (assetGR.next()) {
+                    // Make sure asset is In stock and Available -- *** COMMENTED OUT FOR STRY0040912 ***
+                    //if (assetGR.install_status != "6" || assetGR.substatus != "available") {
+                    //    return "Asset is already allocated";
+                    //}
+                } else {
+                    return "Asset not in SNC inventory";
+                }
+            }
+        }
+        return "";
+    }
+
+    function unreserveAsset(sublineGR, serial) {
+        var inventoryGR = new GlideRecord('x_att2_abs_procure_abspl_inventory_in_stock');
+        if (inventoryGR.get('sys_id', sublineGR.stockroom + "")) {
+            // Re-calculate stockroom
+            inventoryGR.reserved = parseInt(inventoryGR.reserved) - 1;
+            inventoryGR.update();
+        }
+
+        var assetGR = new GlideRecord('alm_asset');
+        assetGR.addQuery('sys_id', sublineGR.asset + "").addOrCondition('serial_number', serial);
+        assetGR.query();
+        if (assetGR.next()) {
+            assetGR.state = '6';
+            assetGR.substatus = 'available';
+            assetGR.update();
+        }
+    }
+
+    function getAsset(model_id, serialNumber, status, stockroom) {
+        var assetGR = new GlideRecord('alm_hardware');
+        assetGR.addQuery('model', model_id);
+        //assetGR.addQuery('model.x_att2_abs_procure_u_abspl', true);
+        assetGR.addQuery('serial_number', serialNumber);
+        assetGR.query();
+        if (assetGR.next()) {
+            new ABSPLAssetUtil().setHWAssetStatusFromMap(assetGR, status);
+            return assetGR.sys_id + "";
+        } else {
+            var consumableGR = new GlideRecord('alm_consumable');
+            consumableGR.addQuery('model.model_number', partNumber);
+            if (stockroom)
+                consumableGR.addQuery('stockroom', stockroom);
+            //consumableGR.addQuery('model.x_att2_abs_procure_u_abspl', true);
+            consumableGR.query();
+            if (consumableGR.next()) {
+                return consumableGR.sys_id + "";
+            } else {
+                var softwareGR = new GlideRecord('alm_license');
+                softwareGR.addQuery('model.model_number', partNumber);
+                if (stockroom)
+                    softwareGR.addQuery('stockroom', stockroom);
+                softwareGR.addQuery('software_model.edition', 'ABSPL');
+                softwareGR.query();
+                if (softwareGR.next()) {
+                    return softwareGR.sys_id + '';
+                }
+            }
+        }
+        return "";
+    }
+
+    function getSublineCount(orderID) {
+        var sublineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+        sublineGR.addQuery('order_summary_key', orderID);
+        sublineGR.addQuery('state', '!=', 'Cancelled');
+        sublineGR.query();
+        return sublineGR.getRowCount();
+    }
+
+    function checkLineParts(partNumber, orderID, ctdiState) {
+        var retVal = false;
+        var lineGR = new GlideRecord('x_att2_abs_procure_abspl_order_line_item');
+        lineGR.addQuery('order', orderID);
+        //lineGR.addQuery('state', '!=', 'Cancelled');
+        lineGR.addQuery('model.model_number', partNumber);
+        lineGR.query();
+        while (lineGR.next()) {
+            if (ctdiState == "PROCHOLD")
+                lineGR.state = 'Procurement Hold';
+            retVal = true;
+        }
+        return retVal;
+    }
+
+    function checkLinePartsTask(partNumber, taskRecord) {
+        var parts = JSON.parse(taskRecord.variables.parts_to_move);
+        for (var p = 0; p < parts.length; p++) {
+            var model = new GlideRecord('cmdb_model');
+            if (model.get(parts[p].part_number + '')) {
+                if (model.model_number == partNumber) return true;
+            }
+        }
+        return false;
+    }
+
+    // Validates that the input string is a valid date formatted as "mm-dd-yyyy"
+    function isValidDate(dateString) {
+        // First check for the pattern
+        if (!/^\d{4}-\d{1,2}-\d{1,2}$/.test(dateString))
+            return false;
+
+        // Parse the date parts to integers
+        var parts = dateString.split("-");
+        var day = parseInt(parts[2], 10);
+        var month = parseInt(parts[1], 10);
+        var year = parseInt(parts[0], 10);
+
+        // Check the ranges of month and year
+        if (year < 1000 || year > 3000 || month == 0 || month > 12)
+            return false;
+
+        var monthLength = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+        // Adjust for leap years
+        if (year % 400 == 0 || (year % 100 != 0 && year % 4 == 0))
+            monthLength[1] = 29;
+
+        // Check the range of the day
+        return day > 0 && day <= monthLength[month - 1];
+    }
+
+    function setDateFromString(date_str) {
+        var date_split = date_str.split('-');
+        var renewed_date = date_split[0] + "-" + date_split[1] + "-" + date_split[2];
+        var gdate = new GlideDate();
+        gdate.setValue(renewed_date);
+        return gdate;
+    }
+};
