@@ -1,0 +1,18 @@
+//abspl Ready to ship Business rule
+
+
+(function executeRule(current, previous /*null when async*/ ) {
+
+    //Send Ready to Ship
+    var action = 'Ready to Ship';
+    var ctdiUtil = new x_att2_abs_procure.ABSPLCTDIIntegration();
+    var ptpResponse = ctdiUtil.sendPickList(current, action);
+    current.processing_log += '\n\nReady to Ship sent to CTDI -- ' + new GlideDateTime() + ' (GMT)';
+    current.processing_log += '\n  -> Response - ' + ptpResponse;
+    current.processing_log = current.processing_log.toString().trim();
+	
+    //Call update in asyn business rule
+    current.setWorkflow(false);
+    current.update();
+
+})(current, previous);
