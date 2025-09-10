@@ -1,0 +1,39 @@
+Scheduled Script Execution (ABSPL Process Ingot File)
+
+var integrationLog = new GlideRecord('x_att2_abs_procure_integration_log');
+integrationLog.addQuery('application', 'Ingot');
+integrationLog.addQuery('flow', 'Inbound');
+integrationLog.addQuery('status', 'Pending');
+integrationLog.query();
+
+while (integrationLog.next()) {
+    var attachRec = new GlideRecord('sys_attachment');
+    attachRec.addQuery('table_sys_id', integrationLog.sys_id + '');
+    attachRec.query();
+    if (attachRec.next()) {
+        var stream = new GlideSysAttachment().getContent(attachRec);
+		integrationLog.request_body = stream;
+		
+		if (stream.indexOf('ORDERDETAILSUPD') != -1) {
+			//ABSPLIngotIntegration.processOrderDetails(stream);
+			try{integrationLog.request_body += ('\n\n' + ABSPLIngotIntegration.processOrderDetails(stream));}
+			catch(e){integrationLog.request_body += ('\n\n' + e.message);}
+		}
+		if (stream.indexOf('ORDERSTATUS') != -1) {
+			try{ABSPLIngotIntegration.processOrderStatus(stream);}
+			catch(e){integrationLog.request_body += ('\n\n' + e.message);}
+		}
+
+
+        //Supplier Feed Updates
+        if (attachRec.file_name.indexOf('SUPPLIER') != -1) {
+            try {ABSPLIngotIntegration.processSupplierUpdate(stream, attachRec.file_name);} 
+			catch(e){integrationLog.request_body += ('\n\n' + e.message);}
+        }
+
+
+        integrationLog.status = 'Processed';
+        integrationLog.update();
+    }
+
+}
