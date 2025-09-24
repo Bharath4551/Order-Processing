@@ -1,0 +1,663 @@
+var ABSPLIngotIntegration = Class.create();
+ABSPLIngotIntegration.prototype = {
+    initialize: function() {
+        var sourceSystem = 'SNW';
+        if (new ABSPLCommonUtil().getInstanceStack() == 'FEDGOV')
+            sourceSystem = 'GOV';
+
+        this.integrationLog = new GlideRecord('x_att2_abs_procure_integration_log');
+        this.integrationLog.application = 'Ingot';
+        this.integrationLog.flow = 'Outbound';
+        this.integrationLog.status = 'Pending';
+        this.integrationLog.type = 'File';
+        this.integrationLog.table = 'x_att2_abs_procure_integration_log';
+        this.integrationLog.endpoint = this._setFileName(sourceSystem);
+
+        //Set the header line
+        this.csvFile = 'HDR|REQIMPORT|' + sourceSystem + '|ORACLESCM\n';
+        //Start a counter for the trailer line
+        this.lineCnt = 0;
+    },
+
+    generateExport: function() {
+        this._errorPreviousUnprocessed();
+        var prRecord = new GlideRecord('x_att2_abs_procure_purchase_requisition');
+        prRecord.addQuery('state', 'Approved');
+        prRecord.addQuery('type', '!=', 'Customer Owned');
+        prRecord.query();
+        if (!prRecord.hasNext())
+            return false;
+
+        while (prRecord.next()) {
+            this._extractPR(prRecord);
+            //this._updateOrderTask(prRecord.order_summary_key);
+            prRecord.state = 'Submitted';
+            prRecord.update();
+        }
+
+        this.csvFile += 'TLR|' + this.lineCnt + '\n';
+        this.integrationLog.request_body = this.csvFile;
+        this.integrationLog.insert();
+
+        return true;
+    },
+
+    _extractPR: function(prRecord) {
+        var dateRequired = this._getValidDateFormat(prRecord.date_required);
+        var purchasingUnit = '';
+        var ingotNumber = prRecord.ingot_number;
+        var governmentIndicator = 'No';
+        var expediteFlag = "0";
+        var serviceLine = prRecord.service_line.name;
+        var serviceRequestNumber = prRecord.order_summary_key.service_request_number.service_request;
+        var destinationName = prRecord.order_summary_key.mark_for_contact_name;
+        var destinationPhone = prRecord.order_summary_key.mark_for_contact_phone_number;
+        var dealID = prRecord.order_summary_key.deal_id;
+
+        var shipToClli = prRecord.ship_to_clli;
+        var shipToContactName = prRecord.ship_to_contact_name;
+        var shipToContactPhone = prRecord.ship_to_phone;
+        if (!prRecord.order_summary_key.staged || prRecord.type == 'ICPO') {
+            shipToClli = prRecord.mark_for_clli;
+        } else {
+            shipToContactName = prRecord.warehouse_contact_name;
+            shipToContactPhone = prRecord.warehouse_contact_phone;
+        }
+
+        if (prRecord.government_indicator)
+            governmentIndicator = 'Yes';
+
+        if (prRecord.expedite_flag)
+            expediteFlag = "1";
+
+        if (gs.getProperty('instance_name').toString().indexOf('attgcc') != -1) {
+            var stagingGR = new GlideRecord('x_att2_abs_procure_stage_order_summary');
+            stagingGR.addQuery('purchase_requisition', prRecord.sys_id + '');
+			stagingGR.addQuery('subtype', 'Stock Order');
+            stagingGR.query();
+            if (stagingGR.next()) {
+                serviceRequestNumber = stagingGR.service_request;
+                destinationName = shipToContactName;
+                destinationPhone = shipToContactPhone;
+                dealID = prRecord.deal_id;
+            }
+        }
+
+
+        var prHeaderLine = 'REQ|'; //Record Type
+        prHeaderLine += ingotNumber + '|'; //EOL number
+        prHeaderLine += 'R|'; //PO Type
+        prHeaderLine += prRecord.approver + '|'; //Requestor ATTUID
+        prHeaderLine += prRecord.mark_for_clli + '|'; //Mark For CLLI
+        prHeaderLine += serviceLine + '|'; //Account Type
+        prHeaderLine += shipToClli + '|'; //Ship to CLLI
+        prHeaderLine += shipToContactName + '|'; //Ship to Contact Name
+        prHeaderLine += '|'; //Ship to Room
+        prHeaderLine += shipToContactPhone + '|'; //Ship to Phone
+        prHeaderLine += expediteFlag + '|'; //Expedite flag indicator
+        prHeaderLine += ingotNumber + '|'; //Customer ID
+        prHeaderLine += prRecord.customer_name + '|'; //Customer Name
+        prHeaderLine += '|'; //Customer Contract Number
+        prHeaderLine += serviceRequestNumber + '|'; //Customer Request Number
+        prHeaderLine += dateRequired + '|'; //Date Required at Ship Site
+        prHeaderLine += prRecord.ownership_indicator + '|'; //Ownership indicator
+        if (prRecord.international) {
+            prHeaderLine += '1|'; //Ship international indicator
+            prHeaderLine += prRecord.ship_to_country.iso3166_2 + '|'; //Ship to Country Code
+            purchasingUnit = prRecord.purchasing_unit;
+        } else {
+            prHeaderLine += '0|'; //Ship international indicator
+            prHeaderLine += '|'; //Ship to Country Code
+        }
+        prHeaderLine += destinationName + '|'; //Final Destination Contact Name
+        prHeaderLine += destinationPhone + '|'; //Final Destination Phone
+        prHeaderLine += dealID + '|'; //Promo Code
+        prHeaderLine += '|'; //Preparer ATTUID (Not needed, do not include)
+        prHeaderLine += purchasingUnit + '|'; //Purchasing Unit
+        prHeaderLine += governmentIndicator + '|'; //Government Indicator
+        prHeaderLine += prRecord.comments; //Comments 
+
+        this.csvFile += prHeaderLine + '\n';
+        this.lineCnt += 1;
+
+        var prLineRecord = new GlideRecord('x_att2_abs_procure_purchase_requisition_line_item');
+        prLineRecord.addQuery('purchase_requisition', prRecord.sys_id + '');
+        prLineRecord.query();
+        while (prLineRecord.next())
+            this._extractPRLine(prLineRecord, ingotNumber);
+    },
+
+    _extractPRLine: function(prLineRecord, ingotNumber) {
+        var specialPrice = "0";
+        if (prLineRecord.special_price)
+            specialPrice = "1";
+
+        var eolLineNumber = prLineRecord.eol_line_number;
+        var manufacturerPartNumber = prLineRecord.model.model_number;
+        var manufacturerName = prLineRecord.model.manufacturer.name;
+
+        var productDescription = (prLineRecord.model.short_description == '') ? prLineRecord.model.display_name : prLineRecord.model.short_description;
+        productDescription = productDescription.toString().replace(/\|/g, '-'); //Replace all '|' with a '-'
+
+        if (eolLineNumber == '1001') { //Staging Cost 
+            manufacturerPartNumber = 'StagingCosts';
+            manufacturerName = prLineRecord.supplier.supplier_name;
+            productDescription = 'Stagings Costs';
+        } else if (eolLineNumber == '1002' || eolLineNumber == '1003') { //Importation Cost or Brokerage Costs
+            manufacturerPartNumber = 'ImportationCosts';
+            manufacturerName = prLineRecord.supplier.supplier_name;
+            productDescription = 'Importation Costs';
+        } else if (prLineRecord.alternate_model_number) {
+            manufacturerPartNumber = prLineRecord.alternate_model_number;
+        }
+
+        var prItemLine = 'ITM|'; //Record Type
+        prItemLine += ingotNumber + '|'; //EOL Number
+        prItemLine += eolLineNumber + '|'; //EOL Line Number
+        prItemLine += prLineRecord.supplier.supplier_key + '|'; //Supplier Key
+        prItemLine += manufacturerPartNumber + '|'; //Manufacturer Part Number
+        prItemLine += prLineRecord.quantity + '|'; //Quantity
+        prItemLine += specialPrice + '|'; //Special Price Indicator
+        prItemLine += prLineRecord.att_unit_price + '|'; //ATT Unit Price
+        prItemLine += prLineRecord.list_unit_price + '|'; //List Unit Price
+        prItemLine += prLineRecord.supplier.currency + '|'; //Price Currency
+        prItemLine += manufacturerName + '|'; //Manufacturer Name 
+        prItemLine += '|'; //Config Reference ID
+        prItemLine += prLineRecord.eol_line_config_sequence_number + '|'; //EHSN # - Configuration Sequence Number
+        prItemLine += '0|'; //Service Indicator
+        prItemLine += productDescription + '|'; //Product Description
+        prItemLine += '|'; //PO Start date
+        prItemLine += '|'; //PO End date
+        prItemLine += '|'; //Term of Lease
+        prItemLine += '|'; //Monthly Lease Amount 
+        prItemLine += '|'; //UOM
+        prItemLine += ''; //Export Indicator 
+
+        this.csvFile += prItemLine + '\n';
+        this.lineCnt += 1;
+    },
+
+    _setFileName: function(sourceSystem) {
+        var returnDateString = sourceSystem + 'ReqImport.';
+
+        var gDate = new GlideDate();
+        var longDateTime = gDate.getByFormat('YYYYMMddHHmm');
+        returnDateString += longDateTime;
+
+        //Get last sequence number and add 1 to it
+        var sequenceValue = '0001'; //Default to 1
+        var lastLogFile = new GlideRecord('x_att2_abs_procure_integration_log')
+        lastLogFile.addQuery('application', 'Ingot');
+        lastLogFile.addQuery('status', 'Processed');
+        lastLogFile.addQuery('flow', 'Outbound');
+        lastLogFile.orderByDesc('sys_created_on');
+        lastLogFile.query();
+        if (lastLogFile.next()) {
+            var sequenceValue = '0001'; //Default back to 1
+            if (!lastLogFile.endpoint.nil()) {
+                var filename = lastLogFile.endpoint.toString().split('.');
+                if (filename[2]) {
+                    var seq = filename[2].toString();
+                    if (seq == '9999')
+                        sequenceValue = '0001';
+                    var plusOne = parseInt(seq) + 1;
+                    var sequenceValue = '' + plusOne;
+                    while (sequenceValue.length < 4) {
+                        sequenceValue = '0' + sequenceValue;
+                    }
+                }
+            }
+        }
+
+        returnDateString += '.' + sequenceValue + '.txt';
+
+        return returnDateString;
+    },
+
+    _errorPreviousUnprocessed: function() {
+        var integrationLog = new GlideRecord('x_att2_abs_procure_integration_log');
+        integrationLog.addQuery('application', 'Ingot');
+        integrationLog.addQuery('flow', 'Outbound');
+        integrationLog.addQuery('status', 'Pending');
+        integrationLog.query();
+        while (integrationLog.next()) {
+            integrationLog.status = 'Error';
+            integrationLog.update();
+        }
+    },
+
+    /*_updateOrderTask: function(orderSummarySysID) {
+        var orderTask = new GlideRecord('x_att2_abs_procure_abs_order_task');
+        orderTask.addQuery('order_summary', orderSummarySysID + '');
+        orderTask.addQuery('task_type', 'EOL Out of stock');
+        orderTask.addQuery('task_stage', 'Requisition Created');
+        orderTask.query();
+        if (orderTask.next()) {
+            orderTask.task_stage = 'Requisition Submitted';
+            orderTask.update();
+        }
+
+    },*/
+
+    _getValidDateFormat: function(dateRequired) {
+        var dateString = dateRequired.toString();
+        var dateSplit = dateString.split("-");
+        var year = parseInt(dateSplit[0], 10);
+        var month = parseInt(dateSplit[1], 10);
+        var day = parseInt(dateSplit[2], 10);
+
+        var formattedDate = month + '/' + day + '/' + year;
+
+        return formattedDate;
+
+    },
+
+    type: 'ABSPLIngotIntegration'
+};
+
+ABSPLIngotIntegration.processOrderDetails = function(strPipedData) {
+    var arrData = strPipedData.split('\n');
+    if (arrData.length < 4) /* Improper file format: Does not contain at least 4 lines (file header, req header, req items, trailer) */
+        return 'ERROR: Improper file format';
+
+    var LOG = [];
+    var LINE_INDEX = {
+        'eol_number': 1,
+        'requisition_number': 2,
+        'po_number': 3,
+        'po_status': 4,
+        'po_version': 5,
+        'eol_line_number': 6,
+        'requisition_line_number': 7,
+        'po_line_number': 8,
+        'supplier_key': 9,
+        'po_manufacturer_part_number': 10,
+        'po_supplier_part_number': 11,
+        'quantity': 13,
+        'att_unit_price': 14,
+        'list_unit_price': 15,
+        'att_total_price': 16,
+        'currency': 17,
+        'po_manufacturer_name': 18,
+        'configuration_sequence_number': 19,
+        'rc_code': 25
+    };
+
+    var header = arrData[0].split('|');
+    var trailer = arrData[arrData.length - 1].split('|');
+    var errorMessage = '';
+
+    //Iterate through lines (not header or trailer)
+    for (var i = 1; i < arrData.length - 2;) {
+
+        var reqArr = arrData[i].split('|');
+        var lines = [];
+        var poArray = [];
+
+        //Gather lines under the same request
+        var sameReq = true;
+        for (var odIdx = i + 1; odIdx < arrData.length - 1 && sameReq; odIdx++) {
+            var line = arrData[odIdx].split('|');
+            if (line[0] == 'OLU') {
+                lines.push(arrData[odIdx].split('|'));
+            } else sameReq = false;
+        }
+
+        if (reqArr[0] != 'OHU')
+            return 'ERROR: Header row type invalid';
+
+
+
+        for (var lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+            var line = lines[lineIdx];
+            var poStatus = line[LINE_INDEX.po_status];
+            var validPoStatuses = [
+                "Ordered",
+                "Canceled",
+                "Shipped",
+                "Shipping",
+                "Confirming",
+                "Confirmed"
+            ];
+
+            if (validPoStatuses.indexOf(poStatus) >= 0) {
+                var cancelledStatus = false;
+                var cancelledPO = '';
+
+                if (poStatus == 'Canceled') {
+                    cancelledStatus = true;
+                    cancelledPO = line[LINE_INDEX.po_number];
+                    poStatus = 'Cancelled';
+                } else
+                    poStatus = 'Ordered';
+
+
+                var reqGR = new GlideRecord('x_att2_abs_procure_purchase_requisition');
+                reqGR.addQuery('ingot_number', reqArr[2]);
+                reqGR.query();
+                if (reqGR.next()) {
+                    //Create/Cancel Purchase Order 
+                    var poGR = new GlideRecord('x_att2_abs_procure_abspl_purchase_order');
+                    poGR.addQuery('purchase_requisition', reqGR.sys_id + '');
+                    poGR.addQuery('po_number', line[LINE_INDEX.po_number] + '');
+                    poGR.query();
+                    var poCount = poGR.getRowCount();
+                    if (poGR.next()) {
+                        if (cancelledStatus) {
+                            if (poGR.po_status != 'Cancelled') {
+                                var cancelOrderTask = new GlideRecord('x_att2_abs_procure_abs_order_task');
+                                cancelOrderTask.initialize();
+                                cancelOrderTask.state = '1'; //Open
+                                cancelOrderTask.order_summary = reqGR.order_summary_key + '';
+                                cancelOrderTask.task_type = 'Notification';
+                                cancelOrderTask.assignment_group = '346fd9e093ff8ad44c18f8f17cba1039'; // ABS Procurement - Procurement Specialists
+                                cancelOrderTask.short_description = "Purchase Order Cancelled: " + cancelledPO;
+                                cancelOrderTask.description = "Purchase Order " + cancelledPO + " has been Cancelled in Ingot.";
+                                cancelOrderTask.insert();
+                            }
+                            poGR.po_status = 'Cancelled';
+                            poGR.update();
+                            if (poCount < 2) {
+                                reqGR.state = 'Cancelled';
+                                reqGR.update();
+                            }
+
+                        } else {
+                            poGR.po_version = line[LINE_INDEX.po_version];
+                            poGR.rc_code = line[LINE_INDEX.rc_code];
+                            poGR.update();
+                        }
+                    } else {
+                        poGR = new GlideRecord('x_att2_abs_procure_abspl_purchase_order');
+                        poGR.initialize();
+                        poGR.purchase_requisition = reqGR.sys_id + '';
+                        poGR.state = 'Draft';
+                        poGR.po_number = line[LINE_INDEX.po_number];
+                        poGR.po_status = poStatus;
+                        poGR.po_version = line[LINE_INDEX.po_version];
+                        poGR.rc_code = line[LINE_INDEX.rc_code];
+                        poGR.insert();
+                    }
+
+                    // update purchase line information
+                    var prLineGR = new GlideRecord('x_att2_abs_procure_purchase_requisition_line_item');
+                    prLineGR.addQuery('purchase_requisition', reqGR.sys_id);
+                    prLineGR.addQuery('eol_line_number', line[LINE_INDEX.eol_line_number]);
+                    prLineGR.query();
+                    if (prLineGR.next()) {
+                        prLineGR.po_number = line[LINE_INDEX.po_number];
+                        prLineGR.po_line_number = line[LINE_INDEX.po_line_number];
+                        prLineGR.po_manufacturer_name = line[LINE_INDEX.po_manufacturer_name];
+                        prLineGR.po_manufacturer_part_number = line[LINE_INDEX.po_manufacturer_part_number];
+                        prLineGR.po_supplier_part_number = line[LINE_INDEX.po_supplier_part_number];
+                        prLineGR.po_quantity = line[LINE_INDEX.quantity];
+                        prLineGR.att_unit_price = line[LINE_INDEX.att_unit_price];
+                        prLineGR.att_total_price = line[LINE_INDEX.att_total_price];
+                        prLineGR.list_unit_price = line[LINE_INDEX.list_unit_price];
+                        prLineGR.supplier_key = line[LINE_INDEX.supplier_key];
+                        prLineGR.purchase_order = poGR.sys_id + '';
+                        if (prLineGR.state == 'Cancelled' && poStatus != 'Cancelled') {
+                            prLineGR.number = '';
+                            prLineGR.state = poStatus;
+                            prLineGR.insert();
+                        } else {
+                            if (prLineGR.state == 'Acknowledged')
+                                prLineGR.state = poStatus;
+                            prLineGR.update();
+                        }
+                    } else {
+
+                        //Get PR Line Item Supplier
+                        var supplierRecordSysId = '';
+                        var supplierGR = new GlideRecord('x_att2_abs_procure_supplier');
+                        supplierGR.addQuery('supplier_key', line[LINE_INDEX.supplier_key]);
+                        supplierGR.query();
+                        if (supplierGR.next()) {
+                            supplierRecordSysId = supplierGR.sys_id + '';
+                        }
+
+                        //Get PR Line Item Model
+                        var modelRecordSysId = '';
+                        var modelGR = new GlideRecord('cmdb_model');
+                        modelGR.addQuery('model_number', line[LINE_INDEX.po_manufacturer_part_number]);
+                        modelGR.query();
+                        if (modelGR.next()) {
+                            modelRecordSysId = modelGR.sys_id + '';
+                        }
+
+                        //Create new PR Line if added in Ingot
+                        prLineGR.initialize();
+                        prLineGR.purchase_requisition = reqGR.sys_id + '';
+                        prLineGR.eol_line_number = line[LINE_INDEX.eol_line_number];
+                        prLineGR.model = modelRecordSysId + '';
+                        prLineGR.supplier = supplierRecordSysId + '';
+                        prLineGR.state = poStatus;
+                        prLineGR.po_number = line[LINE_INDEX.po_number];
+                        prLineGR.po_status = poStatus;
+                        prLineGR.po_line_number = line[LINE_INDEX.po_line_number];
+                        prLineGR.po_manufacturer_name = line[LINE_INDEX.po_manufacturer_name];
+                        prLineGR.po_manufacturer_part_number = line[LINE_INDEX.po_manufacturer_part_number];
+                        prLineGR.po_supplier_part_number = line[LINE_INDEX.po_supplier_part_number];
+                        prLineGR.po_quantity = line[LINE_INDEX.quantity];
+                        prLineGR.quantity = line[LINE_INDEX.quantity];
+                        prLineGR.att_unit_price = line[LINE_INDEX.att_unit_price];
+                        prLineGR.att_total_price = line[LINE_INDEX.att_total_price];
+                        prLineGR.list_unit_price = line[LINE_INDEX.list_unit_price];
+                        prLineGR.eol_line_config_sequence_number = line[LINE_INDEX.configuration_sequence_number];
+                        prLineGR.purchase_order = poGR.sys_id + '';
+                        prLineGR.stockroom = getStockroom(reqGR.order_summary_key.mark_for_country + '', reqGR.order_summary_key.service_line + '');
+                        prLineGR.insert();
+                    }
+
+                    var poRecord = new GlideRecord('x_att2_abs_procure_abspl_purchase_order');
+                    poRecord.addQuery('purchase_requisition', reqGR.sys_id + '');
+                    poRecord.addQuery('state', 'Draft');
+                    poRecord.query();
+                    if (poRecord.next())
+                        poArray.push(poRecord.sys_id + '');
+
+                    if (!cancelledStatus && reqGR.state == 'Acknowledged') {
+                        reqGR.state = 'Ordered';
+                        reqGR.update();
+                    }
+
+                } else {
+                    errorMessage += 'ERROR: Purchase requisition record not found for ' + reqArr[2];
+                }
+            }
+        }
+        var dateTime = new GlideDateTime();
+        reqGR.processing_log += '\n\nOrder Details update received from INGOT: ' + line[LINE_INDEX.po_number] + ' ' + poStatus + ' -- ' + dateTime + ' (GMT)';
+        reqGR.update();
+
+        //Update POs to Ordered to trigger PartsInPO feed to CTDI
+        var orderedPOs = new GlideRecord('x_att2_abs_procure_abspl_purchase_order');
+        orderedPOs.addEncodedQuery('sys_idIN' + poArray + '');
+        orderedPOs.query();
+        while (orderedPOs.next()) {
+            orderedPOs.state = 'Ordered';
+            orderedPOs.update();
+        }
+
+        //Jump to next OHU line
+        if (lines.length) {
+            i = i + lines.length + 1;
+        } else i++;
+    }
+
+    return LOG.join(' | ') + '\n\n' + errorMessage;
+
+};
+
+function getStockroom(markForCountry, serviceLine) {
+    // Reservation rule lookup
+    var ruleGR = new GlideRecord('x_att2_abs_procure_reservation_rule');
+    ruleGR.addActiveQuery();
+    ruleGR.addQuery('service_line', serviceLine + '');
+    ruleGR.addEncodedQuery('effective_dateRELATIVELT@minute@ago@0^warehouse.countryLIKE' + markForCountry + ''); // Effective date is in the past
+    ruleGR.orderByDesc('effective_date');
+    ruleGR.query();
+    if (ruleGR.next()) {
+        //We check each stockroom's inventory in order
+        var stockroomGR = new GlideRecord('x_att2_abs_procure_reservation_rule_stockroom');
+        stockroomGR.addQuery('reservation_rule', ruleGR.sys_id + "");
+        stockroomGR.orderBy('order');
+        stockroomGR.query();
+        if (stockroomGR.next()) {
+            return stockroomGR.stockroom + "";
+        }
+    }
+}
+
+
+ABSPLIngotIntegration.processOrderStatus = function(strPipedData) {
+    /* 
+     **	If the EOL/PR was sent with a Success; update the Purchase Requistion with a state of Received
+     **	If the EOL/PR was sent with a Error; update the Purchase Requistion with a state of Error
+     **
+     **	On error
+     **	--> if there is a Task already created from Out of Stock - update the Task record and change state
+     **	--> If there is not a Teask already, create one and assign to Procurement specialist team
+     */
+
+    var arrData = strPipedData.split('\n');
+    if (arrData.length < 3) /* Improper file format: Does not contain at least 4 lines (file header, req items, trailer) */
+        return;
+
+    var LINE_INDEX = {
+        'record_type': 0,
+        'eol_number': 1,
+        'eol_line_number': 2,
+        'requisition_number': 3,
+        'status': 4,
+        'text': 5,
+        'error_source': 6
+    };
+
+    var header = arrData[0].split('|');
+    var trailer = arrData[arrData.length - 1].split('|');
+
+    for (var i = 1; i < arrData.length - 1; i++) {
+
+        var reqArr = arrData[i].split('|');
+
+        var reqGR = new GlideRecord('x_att2_abs_procure_purchase_requisition');
+        reqGR.addQuery('state', '!=', 'Ordered');
+        reqGR.addQuery('ingot_number', reqArr[LINE_INDEX.eol_number] + '');
+        reqGR.query();
+        if (reqGR.next()) {
+            var dateTime = new GlideDateTime();
+            reqGR.processing_log += ('\n\n\nStatus update received from INGOT: ' + reqArr[LINE_INDEX.status] + ' -- ' + dateTime + ' (GMT)');
+
+            if (reqArr[LINE_INDEX.text])
+                reqGR.processing_log += ('\n  -> ' + reqArr[LINE_INDEX.text]);
+
+            if (reqArr[LINE_INDEX.status].toLowerCase() == 'success') {
+                reqGR.state = 'Acknowledged';
+                reqGR.requisition_number = reqArr[LINE_INDEX.requisition_number];
+            }
+
+            if (reqArr[LINE_INDEX.status].toLowerCase() == 'failed') {
+                var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+                taskGR.initialize();
+                if (reqGR && reqGR.isValidRecord())
+                    taskGR.order_summary = reqGR.order_summary_key + "";
+                taskGR.assignment_group = '346fd9e093ff8ad44c18f8f17cba1039'; // ABS Procurement - Procurement Specialists
+                taskGR.short_description = 'Purchase Requisition Failure for ' + reqGR.number;
+                taskGR.description = 'A failure has occurred for this purchase requisition';
+                if (reqArr[LINE_INDEX.text])
+                    taskGR.description += ('\n"' + reqArr[LINE_INDEX.text] + '"');
+                taskGR.insert();
+
+                reqGR.state = 'Error';
+                reqGR.processing_log += ('\n\n        -> Task created for manual intervention: ' + taskGR.number);
+            }
+
+            if (reqArr[LINE_INDEX.eol_line_number]) {
+                var prLineGR = new GlideRecord('x_att2_abs_procure_purchase_requisition_line_item');
+                prLineGR.addQuery('purchase_requisition', reqGR.sys_id);
+                prLineGR.addQuery('eol_line_number', reqArr[LINE_INDEX.eol_line_number]);
+                prLineGR.query();
+                while (prLineGR.next()) {
+                    prLineGR.notes = reqArr[LINE_INDEX.status];
+                    if (reqArr[LINE_INDEX.text])
+                        prLineGR.notes += (' - "' + reqArr[LINE_INDEX.text] + '"');
+                    prLineGR.update();
+
+                    reqGR.processing_log += ('\n        -> ' + prLineGR.eol_line_number + ': ' + prLineGR.notes);
+                }
+            }
+
+            reqGR.update();
+        }
+
+    }
+};
+
+ABSPLIngotIntegration.processSupplierUpdate = function(strPipedData, fileName) {
+    var arrData = strPipedData.trim().split('\n');
+    if (arrData.length < 3) /* Improper file format: Does not contain at least 4 lines (file header, req items, trailer) */
+        return;
+
+    var LINE_INDEX = {
+        'record_type': 0,
+        'name': 1,
+        'alt_name': 2,
+        'number': 3,
+        'location': 4,
+        'site_city': 5,
+        'site_street': 6,
+        'site_postal_code': 7,
+        'site_state': 8,
+        'site_country': 9,
+        'internal_code': 10,
+        'key': 11,
+        'order_method': 12,
+        'org_id': 13,
+    };
+
+    var header = arrData[0].split('|');
+    var trailer = arrData[arrData.length - 1].split('|');
+
+    for (var i = 1; i < arrData.length - 1; i++) {
+        var reqArr = arrData[i].split('|');
+        //Set Country
+        var country_lookup = reqArr[LINE_INDEX.site_country];
+        var countryUtil = new ABSPLCountries();
+        var countryObj = countryUtil.GetCountriesObj();
+        for (var j in countryObj.countries) {
+            if (countryObj.countries[j]['name'] == country_lookup ||
+                countryObj.countries[j]['iso3166_3'] == country_lookup ||
+                countryObj.countries[j]['iso3166_2'] == country_lookup) {
+                var country = countryObj.countries[j]['sys_id'];
+            }
+        }
+
+        var suppGR = new GlideRecord('x_att2_abs_procure_supplier');
+        if (suppGR.get('supplier_key', reqArr[LINE_INDEX.key])) {
+            if (fileName.toString().toUpperCase().indexOf('SNWSUPPLIERADD') >= 0) {
+                suppGR.active = 'true';
+                suppGR.supplier_name = reqArr[LINE_INDEX.name];
+                suppGR.vendor_id = reqArr[LINE_INDEX.number];
+                if (!suppGR.default_icpo) {
+                    suppGR.purchasing_unit = reqArr[LINE_INDEX.org_id] == '42' ? 'US' : reqArr[LINE_INDEX.org_id];
+                    suppGR.country = country + '';
+                }
+            } else if (fileName.toString().toUpperCase().indexOf('SNWSUPPLIERDEL') >= 0) {
+                suppGR.active = 'false';
+            }
+            suppGR.update();
+        } else {
+            suppGR.initialize();
+            suppGR.supplier_key = reqArr[LINE_INDEX.key];
+            suppGR.active = 'true';
+            suppGR.supplier_name = reqArr[LINE_INDEX.name];
+            suppGR.purchasing_unit = reqArr[LINE_INDEX.org_id] == '42' ? 'US' : reqArr[LINE_INDEX.org_id];
+            suppGR.vendor_id = reqArr[LINE_INDEX.number];
+            suppGR.country = country + '';
+            suppGR.insert();
+        }
+    }
+
+
+};
