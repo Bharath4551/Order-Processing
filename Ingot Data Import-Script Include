@@ -1,0 +1,379 @@
+var INGOT_Data_Import = Class.create();
+INGOT_Data_Import.prototype = {
+    FLAG: false,
+	REQID: "",
+    initialize: function() {},
+    segregateFile: function(type, id) {
+        var attGR = new GlideRecord('sys_attachment');
+        attGR.get(id);
+        if (type == 'REQStatus')
+            this.reqStatus(attGR);
+        else if (type == 'PO')
+            this.poData(attGR);
+        else if (type == 'Supplier')
+            this.supplier(attGR, attGR.getValue('file_name'));
+    },
+    reqStatus: function(attachmentGR) {
+        var gsa = new GlideSysAttachment();
+        var data = gsa.getContent(attachmentGR);
+		gs.info("Line no 19 Runnign");
+        var tempArr = data.split('\n'); //split the attachment content by new line
+        //var lineArr =tempArr.slice(1,-1); //remove header and trailer
+        tempArr.shift();
+        tempArr.pop();
+        for (var i = 0; i < tempArr.length; i++) { //iterate each line to process
+            this.insertReqStatusData(tempArr[i]);
+        }
+
+    },
+
+    insertReqStatusData: function(tempArr) {
+        var splitData = tempArr.split('|'); //split the data with pipe and map the dat
+        //if supplier_key is not empty process it
+		if (splitData[1].startsWith('IC')) {
+            splitData[1] = splitData[1].substring(2,splitData[1].length);
+            if (/\b\d/.test(splitData[1]))
+                splitData[1] = 'AVTS' + splitData[1];
+        } else if (/\b\d/.test(splitData[1])) //check weather orderId starts with digit
+            splitData[1] = 'AVTS' + splitData[1];
+		gs.info("line no 39 "+ splitData[1]);
+        if (splitData[4].toLowerCase() == 'failed') {
+            var caseGr = new GlideRecord('x_att2_abs_procure_purchase_line');
+            caseGr.addQuery('order_case_number', splitData[1]);
+            caseGr.query();
+            if (caseGr.next()) {
+				if(caseGr.status=='icpo_pending')
+					caseGr.status='on_hold';
+				else
+					caseGr.state = 'on_hold';
+                caseGr.update();
+            }
+            //	else if(tempArr[i].substring(0,3)=='IMP' && tempArr[i].includes('Failed')){
+            this.statusTask(tempArr);
+            //}
+            var stagingGr2 = new GlideRecord('x_att2_abs_procure_staging');
+            stagingGr2.initialize();
+            stagingGr2.setValue('u_case_number', caseGr.order_case_number);
+            stagingGr2.setValue('u_number', caseGr.getUniqueValue());
+            stagingGr2.setValue('u_status', 'Failed'); // change value
+            stagingGr2.setValue('u_source', 'ingot');
+            stagingGr2.setValue('u_destination', 'hermes');
+            stagingGr2.setValue('u_log', 'INGOT Requisition Status');
+            stagingGr2.setValue('u_response', splitData[5]);
+            stagingGr2.setValue('u_request',tempArr);
+            if (splitData[2] != '')
+                stagingGr2.setValue('u_order_line_item_number', splitData[2]);
+            stagingGr2.insert();
+        } else {
+			
+            var itemGr = new GlideRecord('x_att2_abs_procure_purchase_line_items');
+            itemGr.addQuery('purchase_line.order_case_number', splitData[1]);
+            itemGr.addQuery('u_substate', 'in_transit');
+            //itemGr.addQuery('number',splitData[2]);
+            itemGr.query();
+			//gs.info("Line no 63 Runnign "+itemGr.getRowCount()+" "+splitData[1]);
+            while (itemGr.next()) {
+                itemGr.pr_number = splitData[3];
+                itemGr.setValue('u_state', 'open');
+                itemGr.setValue('u_substate', 'accepted');
+                itemGr.update();
+            }
+            var gr = new GlideRecord('sn_shop_purchase_requisition');
+            if (gr.get('x_att2_abs_procure_order_case_number', splitData[1])) {
+                gr.setValue('state', '40');
+                gr.update();
+            }
+			
+			var caseGr = new GlideRecord('x_att2_abs_procure_purchase_line');
+            caseGr.addQuery('order_case_number', splitData[1]);
+            caseGr.query();
+			
+			if(caseGr.next()){
+				var stagingGr2 = new GlideRecord('x_att2_abs_procure_staging');
+				stagingGr2.initialize();
+				stagingGr2.setValue('u_case_number', caseGr.order_case_number);
+				stagingGr2.setValue('u_number', caseGr.getUniqueValue());
+				stagingGr2.setValue('u_status', 'Success'); // change value
+				stagingGr2.setValue('u_source', 'ingot');
+				stagingGr2.setValue('u_destination', 'hermes');
+				stagingGr2.setValue('u_log', 'INGOT Requisition Status');
+				stagingGr2.setValue('u_response', splitData[5]);
+				stagingGr2.setValue('u_request',tempArr);
+				if (splitData[2] != '')
+					stagingGr2.setValue('u_order_line_item_number', splitData[2]);
+				stagingGr2.insert();
+			}
+        }
+    },
+    statusTask: function(tempArr) {
+        var splitData = tempArr.split('|');
+        var orderId = splitData[1];
+
+        if (orderId.startsWith('PR')) {
+            var taskGr = new GlideRecord('sn_spend_psd_procurement_task');
+            taskGr.addEncodedQuery('x_att2_abs_procure_task_type=inventory_replenishment^x_att2_abs_procure_pr_number.number=' + orderId);
+            taskGr.query();
+            if (taskGr.next())
+                var orderSys = taskGr.getValue('x_att2_abs_procure_pr_number');
+			
+			taskGr.addEncodedQuery('state=1^short_descriptionSTARTSWITHError^x_att2_abs_procure_pr_number.number=' + orderId);
+			taskGr.query();
+			if(taskGr.next()){
+				taskGr.setValue('short_description',taskGr.getValue('short_description')+"\n"+'Error:' + splitData[5]);
+				taskGr.update();
+			}
+			else{
+            taskGr.initialize();
+            taskGr.setValue('x_att2_abs_procure_task_type', 'inventory_replenishment');
+            taskGr.setValue('short_description', 'Error: ' + splitData[5]);
+			taskGr.setValue('state', '1');
+            taskGr.setValue('x_att2_abs_procure_pr_number', orderSys);
+            taskGr.insert();
+			}
+		}
+	else{ 
+        if (orderId.startsWith('IC')) {
+            orderId = orderId.substring(2, orderId.length);
+            if (/\b\d/.test(orderId))
+                orderId = 'AVTS' + orderId;
+        } else if (/\b\d/.test(orderId)) //check weather orderId starts with digit
+            orderId = 'AVTS' + orderId;
+
+        gs.info('Line no 119  ' + orderId + " " + tempArr);
+        var taskGr = new GlideRecord('sn_spend_psd_procurement_task');
+        taskGr.addEncodedQuery('x_att2_abs_procure_task_type=procurement^x_att2_abs_procure_u_ol_number.order_case_number=' + orderId);
+        taskGr.query();
+		  var orderSys='';
+        if (taskGr.next())
+             orderSys = taskGr.getValue('x_att2_abs_procure_u_ol_number');
+		gs.info('Line no 128  ' + orderSys + " " + taskGr.getRowCount());
+		taskGr.addEncodedQuery('state=1^short_descriptionSTARTSWITHError^x_att2_abs_procure_u_ol_number.order_case_number=' + orderId);
+		taskGr.query();
+		gs.info('Line no 131  '  + taskGr.getRowCount());
+		if(taskGr.next()){
+			taskGr.setValue('short_description',taskGr.getValue('short_description')+"\n"+'Error:' + splitData[5]);
+			taskGr.update();
+		}
+		else{
+        taskGr.initialize();
+		taskGr.setValue('x_att2_abs_procure_task_type', 'procurement');
+        taskGr.setValue('state', '1');
+        taskGr.setValue('short_description', 'Error:' + splitData[5]);
+        taskGr.setValue('x_att2_abs_procure_u_ol_number', orderSys);
+        //         var ed = new GlideDate();
+        // 		taskGr.setValue('opened_at', date);
+        //         ed.addDaysLocalTime(7);
+        //         var date = ed.getValue();
+        //         taskGr.setValue('due_date', date);
+        taskGr.insert();
+		}
+	}
+    },
+    poData: function(attachmentGR) {
+        var gsa = new GlideSysAttachment();
+        var data = gsa.getContent(attachmentGR);
+        var tempArr = data.split('\n'); //split the attachment content by new line
+        //var lineArr =tempArr.slice(1,-1); //remove header and trailer
+        var req_id = '';
+
+        for (var i = 0; i < tempArr.length; i++) { //iterate each line to process
+            gs.info(" Line no 78 " + this.FLAG + "  " + tempArr[i]);
+            if (tempArr[i].substring(0, 3) == 'OHU') {
+                //gs.info('KN3 OHU');
+                req_id = this.insertPOHeaderData(tempArr[i]);
+                //gs.info('KN3 '+req_id);
+            } else if (tempArr[i].substring(0, 3) == 'OLU') {
+                gs.info(req_id + " Line no 81 " + this.FLAG + "  " + tempArr[i]);
+                this.insertPOLineData(tempArr[i], req_id, this.FLAG);
+            }
+        }
+    },
+    insertPOHeaderData: function(tempArr) {
+        var splitData = tempArr.split('|'); //split the data with pipe and map the data
+        var gr = new GlideRecord('sn_shop_purchase_requisition');
+		if(splitData[2].startsWith("PR")) gr.addEncodedQuery('number=' + splitData[2] + '^purchase_orderISEMPTY');
+        else{ 
+			if (splitData[2].startsWith('IC')) {
+            splitData[2] = splitData[2].substring(2, splitData[2].length);
+            if (/\b\d/.test(splitData[2]))
+                splitData[2] = 'AVTS' + splitData[2];
+				} else if (/\b\d/.test(splitData[2])) //check weather orderId starts with digit
+					splitData[2] = 'AVTS' + splitData[2];
+			gr.addEncodedQuery('x_att2_abs_procure_order_case_number=' + splitData[2] + '^purchase_orderISEMPTY');}
+        gr.query();
+
+        if (gr.next()) {
+            this.REQID = gr.getUniqueValue();
+            this.FLAG = gr.needs_attention;
+
+        }
+        //gs.info('KN4 after insert');
+        gs.info('ingot po step 1' + this.REQID + this.FLAG);
+        return this.REQID;
+    },
+
+    insertPOLineData: function(tempArr, id, icpo_flag) {
+        var splitData = tempArr.split('|'); //split the data with pipe and map the data
+        var line_id = '';
+        gs.info('KN5 '+id);
+        var gr = new GlideRecord('sn_shop_purchase_order');
+        gr.addQuery('erp_number', splitData[3]);
+        gr.query();
+        if (gr.next()) {
+            line_id = gr.getUniqueValue();
+            gs.info('KN5 line_id existing ' + line_id);
+        } else {
+			if (splitData[1].startsWith('IC')) {
+            splitData[1] = splitData[1].substring(2, splitData[1].length);
+            if (/\b\d/.test(splitData[1]))
+                splitData[1] = 'AVTS' + splitData[1];
+        } else if (/\b\d/.test(splitData[1])) //check weather orderId starts with digit
+            splitData[1] = 'AVTS' + splitData[1];
+            var gr1 = new GlideRecord('sn_shop_purchase_order');
+            gr1.initialize();
+            gr1.erp_number = splitData[3];
+            gr1.display_name = splitData[3];
+            gr1.sales_order_number = splitData[1];
+            gr1.purchase_requisition = id;
+            //gr1.x_att2_abs_procure_order_case_number = splitData[1];
+            if (splitData[4] == 'Ordered')
+                gr1.status = 'ordered';
+            line_id = gr1.insert();
+            gs.info('KN5 line_id created' + line_id);
+        }
+		var supValue='';
+		var sup=new GlideRecord('sn_fin_supplier');
+			if(sup.get('erp_company_code',splitData[9]))
+					supValue=sup.getUniqueValue();
+        var gr2 = new GlideRecord('sn_shop_purchase_requisition');
+        gr2.get(id);
+        gr2.setValue('state', 50);
+        gr2.setValue('purchase_order', line_id);
+		gr2.setValue('supplier',supValue);
+        gr2.update();
+        gs.info('ingot po step 2' + line_id);
+
+        if (splitData[1].startsWith('PR') || splitData[1].startsWith('PO')) {
+            gs.info('Requisition-enter into purchase line section ');
+
+            var prl = new GlideRecord('sn_shop_purchase_line');
+            prl.addQuery('spend_purchase_requisition.number', splitData[1]);
+            prl.addQuery('number', splitData[6]);
+            prl.query();
+            gs.info(prl.getRowCount() + "requisition");
+            //mapping fields 
+            if (prl.next()) {
+                prl.setValue('state', 'closed_complete');
+				prl.negotiated_unit_cost.setDisplayValue('USD;'+splitData[15]);
+				prl.starting_unit_cost.setDisplayValue('USD;'+splitData[14]);
+//			if(prl.supplier.erp_company_code!=splitData[9]){
+// 			var sup=new GlideRecord('sn_fin_supplier');
+// 			if(sup.get('erp_company_code',splitData[9])) prl.setValue('supplier',sup.getUniqueValue());
+//			}
+				prl.setValue('supplier',supValue);
+                prl.update();
+                gs.info('Requisition- purchase line record update ');
+            }
+        } else {if (splitData[1].startsWith('IC')) {
+            splitData[1] = splitData[1].substring(2, splitData[1].length);
+            if (/\b\d/.test(splitData[1]))
+                splitData[1] = 'AVTS' + splitData[1];
+        } else if (/\b\d/.test(splitData[1])) //check weather orderId starts with digit
+            splitData[1] = 'AVTS' + splitData[1];
+
+            var gr2 = new GlideRecord('x_att2_abs_procure_purchase_line_items');
+            gr2.addEncodedQuery('purchase_line.order_case_number=' + splitData[1] + '^number=' + splitData[6]);
+            gr2.query();
+            if (gr2.next()) {
+                gs.info('KN6 updating OLI');
+                //gr2.po_number = line_id;
+                var finalOffer = gr2.getValue('at_t_price');
+                var finalOfferStr = finalOffer.split(';')[1];
+                var finalOfferInt = parseInt(finalOfferStr);
+                if (finalOfferInt != parseInt(splitData[14]))
+                    gr2.setValue('at_t_price', splitData[14]);
+                var finalOffer1 = gr2.getValue('mfg_list_price');
+                var finalOfferStr1 = finalOffer1.split(';')[1];
+                var finalOfferInt1 = parseInt(finalOfferStr1);
+                if (finalOfferInt1 != parseInt(splitData[15]))
+                    gr2.setValue('mfg_list_price', splitData[15]);
+                gs.info('ingot po.....before flag cond.....' + icpo_flag);
+                if (icpo_flag) {
+                    gr2.setValue('u_icpo_number', line_id);
+                } else {
+                    gr2.setValue('po_number', line_id);
+                    gr2.u_state = 'open';
+                    gr2.u_substate = 'ordered';
+                }
+				var sup=new GlideRecord('sn_fin_supplier');
+				if(sup.get('erp_company_code',splitData[9])) gr2.setValue('supplier',sup.getUniqueValue());
+                gr2.update();
+                gs.info('ingot po step 3 -updated ' + id);
+            }
+            var pl = new GlideRecord('sn_shop_purchase_line');
+            pl.addQuery('spend_purchase_requisition', id);
+            pl.query();
+
+            while (pl.next()) {
+                pl.setValue('state', 'closed_complete');
+                pl.update();
+                gs.info('updated pl to clodsed....line no 165');
+            }
+        }
+    },
+    supplier: function(attachmentGR, file_name) {
+        var gsa = new GlideSysAttachment();
+        var data = gsa.getContent(attachmentGR);
+        var tempArr = data.split('\n');
+        tempArr.shift();
+        if (tempArr[(tempArr.length) - 1] == '')
+            tempArr.pop();
+        tempArr.pop();
+        var filename = file_name;
+        if (filename.includes('DEL'))
+            for (var i = 0; i < tempArr.length; i++) { //iterate each line to process
+                this.deleteSupplierData(tempArr[i]);
+            }
+        if (filename.includes('ADD'))
+            for (var j = 0; j < tempArr.length; j++) { //iterate each line to process
+                this.insertSupplierData(tempArr[j]);
+            }
+    },
+    insertSupplierData: function(tempArr) {
+        var splitData = tempArr.split('|'); //split the data with pipe and map the dat
+
+        //gs.info('does not exists Creating new supplier record');
+        var supObj = new GlideRecord('sn_fin_supplier');
+        supObj.initialize();
+        //supObj.record_type = splitData[0];
+        supObj.legal_name = splitData[1];
+        //splitData[2] -- Alternate Supplier Name
+        supObj.x_att2_abs_procure_supplier_id = splitData[3];
+        supObj.region = splitData[4];
+        supObj.city = splitData[5];
+        supObj.street = splitData[6];
+        supObj.zip = splitData[7];
+        supObj.state = splitData[8];
+        supObj.country = splitData[9];
+        //supObj.internal_code = splitData[10];
+        supObj.erp_company_code = splitData[11];
+        //supObj.preferred_ordering_method = splitData[12];
+        supObj.x_att2_abs_procure_org_id = splitData[13];
+        supObj.insert();
+    },
+    deleteSupplierData: function(tempArr) {
+        var splitData = tempArr.split('|'); //split the data with pipe and map the dat
+        //if supplier_key is not empty process it
+        if (!splitData[11] == "") {
+            var supObj = new GlideRecord('sn_fin_supplier');
+            supObj.addQuery('erp_company_code', splitData[11]);
+            supObj.query();
+            gs.info('Row Count is  :: ' + supObj.getRowCount() + ' ' + splitData[3]);
+            if (supObj.next()) { //if exist update the fileds
+                supObj.active = false;
+                supObj.update();
+            }
+        }
+    },
+    type: 'INGOT_Data_Import'
+};
