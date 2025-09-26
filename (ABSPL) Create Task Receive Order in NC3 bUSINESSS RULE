@@ -1,0 +1,22 @@
+(function executeRule(current, previous /*null when async*/ ) {
+
+    var orderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+    if (orderGR.get(current.order_summary_key + '')) {
+
+        var ctdiWarehouse = new GlideRecord('x_att2_abs_procure_warehouse_to_country_map');
+        if (!ctdiWarehouse.get('clli_code', current.ship_to_clli)) {
+
+            var openTask = new GlideRecord('x_att2_abs_procure_abs_order_task');
+            openTask.addQuery('order_summary', orderGR.sys_id + '');
+            openTask.addQuery('task_type', 'Receive Order in NC3');
+			openTask.query();
+            if (!openTask.next()) {
+				
+                var shortDesc = 'Receive the order in NC3/GPS or ABSPL';
+                var description = "Reminder to complete the PO shipping details in ABSPL or push the button in NC3 and confirm the PO has been shipped.";
+                new ABSPLCommonUtil().createOrderTask(orderGR, 'Receive Order in NC3', shortDesc, description);
+            }
+        }
+    }
+
+})(current, previous);
