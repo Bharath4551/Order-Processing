@@ -1,0 +1,37 @@
+checkPastDueOrders();
+
+function checkPastDueOrders() {
+    var today = new GlideDate();
+
+    var order_sum = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+    order_sum.addNotNullQuery('return_setting');
+	order_sum.addNotNullQuery('return_deadline');
+    order_sum.addQuery('return_deadline', '<=', today.getValue());
+    order_sum.addQuery('order_type', 'return');
+    order_sum.addQuery('state', 'NOT IN','Complete,Cancelled');
+    order_sum.query();
+    while (order_sum.next()) {
+
+        //Set line item assets to missing
+        var line = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+        line.addQuery('order_summary_key', order_sum.sys_id + '');
+        line.addQuery('state', 'Not Recovered').addOrCondition('state', 'Pending Return');
+       // line.addNotNullQuery('asset');
+        line.query();
+        while (line.next()) {
+			line.state = 'Not Recovered';
+			line.update();
+            var asset = new GlideRecord('alm_asset');
+            if (asset.get(line.asset + '')) {
+                new ABSPLAssetUtil().setHWAssetStatusFromMap(asset, 'missing', true);
+            }
+        }
+
+		new ABSPLOrderStatus(order_sum).sendAlert(ABSPLAlerts.RTN_EQP_NOT_RCV_BY_DEADLINE, '', false);
+
+ //       order_sum.state = 'Complete';
+ //       order_sum.substate = 'Not Returned';
+ //       order_sum.update();
+    }
+
+}
