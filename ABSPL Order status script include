@@ -1,0 +1,570 @@
+var ABSPLOrderStatus = Class.create();
+
+ABSPLOrderStatus.prototype = {
+    initialize: function(order) {
+        this.LOG = [];
+        this._errGrp = '3df59c34eb5156901c75fd77cad0cd5d' /* ABSPL Admin */ ;
+
+        this.orderGR = order;
+        if (typeof order == 'string') {
+            var orderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+            if (orderGR.get(order))
+                this.orderGR = orderGR;
+            else {
+                var stageOrderGR = new GlideRecord('x_att2_abs_procure_stage_order_summary');
+                if (stageOrderGR.get(order))
+                    this.orderGR = stageOrderGR;
+            }
+        }
+
+        this.setStatus(this.orderGR.state + '', this.orderGR.substate + '', 100); /* Default values */
+        this.setSystem(this.orderGR.sending_system + '');
+    },
+
+    setStatus: function(status, message, code) {
+        if (status && typeof status == 'string')
+            this.status = status;
+
+        if (message && typeof message == 'string')
+            this.statusMessage = message;
+
+        if (code)
+            this.statusCode = parseInt(code);
+    },
+
+    getStatus: function() {
+        return this.status;
+    },
+
+    getStatusMessage: function() {
+        return this.statusMessage;
+    },
+
+    setSystem: function(system) {
+        if (!system)
+            return;
+        this.system = system;
+        this._appConfig = new ABSPLAppConfig(this.system);
+        this.send_updates = this._appConfig != null &&
+            this._appConfig.send_status_updates_rest &&
+            this._appConfig.send_status_updates_rest.toString().toLowerCase() === 'true' &&
+            this.orderGR &&
+            this.orderGR.isValidRecord() &&
+            this.orderGR.suppress_upstream_messages.toString() != 'true';
+    },
+
+    getSystem: function() {
+        return this.system;
+    },
+
+    sendStatusUpdate: function(includeLines, forceSend, linesMatchOrder) {
+        var shouldSendUpdate = ((forceSend + '').toLowerCase() == 'true' || this.send_updates);
+        if (!shouldSendUpdate || !(this.orderGR && this.orderGR.isValidRecord()))
+            return false;
+        var payload = {
+            SendingSystem: "ABSPL",
+            EOLNumber: this.orderGR.eol_number + '',
+            OrderStatus: this.status,
+            StatusMessage: this.statusMessage
+        };
+
+        if (this.orderGR.isValidField('service_request_number'))
+            payload.ServiceRequest = this.orderGR.service_request_number.getDisplayValue();
+        else if (this.orderGR.isValidField('service_request'))
+            payload.ServiceRequest = this.orderGR.service_request.getDisplayValue();
+        else
+            payload.ServiceRequest = '';
+
+        if (includeLines && (includeLines + '').toLowerCase() == 'true') {
+            var lineTable = 'x_att2_abs_procure_abspl_order_sub_line_item';
+            var lineFields = [
+                ['SourceSystemLineItemNumber', 'order_line_key.source_system_line_item_number'],
+                ['ConfigurationSequenceNumber', 'order_line_key.configuration_sequence_number'],
+                ['SerialNumber', 'serial_number'],
+                ['Manufacturer', 'order_line_key.manufacturer'],
+                ['ManufacturerPartNumber', 'order_line_key.manufacturer_part_number'],
+                ['ShippingType', 'shipping_type'],
+                ['ShippingCarrier', 'shipping_carrier'],
+                ['TrackingNumber', 'tracking_number'],
+                ['ShippedDate', 'shipping_date'],
+                ['AssetTag', 'asset_tag'],
+                ['MacAddress', 'asset.mac_address'],
+                ['PONumber', ''],
+                ['Status', 'state'],
+                ['LineSysId', 'order_line_key.sys_id'],
+				['ManufacturerListPrice', '']
+            ];
+            payload.LineItems = this._getItemsArray(lineTable, lineFields);
+
+            var validStatuses = ['Pending Activation', 'Out of Stock', 'Partial Stock', 'Ordered'];
+            var hasMissingListPrice = false;
+			
+            if (validStatuses.includes(this.orderGR.substate.toString())) {
+                for (var pIdx = 0; pIdx < payload.LineItems.length; pIdx++) {
+                    var item = payload.LineItems[pIdx];
+                    var linePO = this._getSummaryLinePO(item.ManufacturerPartNumber);
+                    if (linePO && linePO.number) {
+                        item.PONumber = linePO.number;
+                        item.ManufacturerListPrice = linePO.listPrice;
+                        if (!linePO.listPrice || linePO.listPrice == '0')
+                            hasMissingListPrice = true;
+                        if (this.orderGR.substate != 'Pending Activation' && linePO.status == 'Ordered')
+                            item.Status = linePO.status;
+                    }
+                }
+            }
+			
+            if (hasMissingListPrice)
+               this.sendAlert(ABSPLAlerts.NO_LIST_PRICE_FOUND);
+
+            if (linesMatchOrder)
+                for (var lmIdx = 0; lmIdx < payload.LineItems.length; lmIdx++)
+                    payload.LineItems[lmIdx].Status = payload.OrderStatus;
+        }
+
+        this._sendREST(payload, this._appConfig.status_rest_message, this._appConfig.status_rest_method);
+    },
+
+    sendStatusForRework: function(includeLines, forceSend, linesMatchOrder, reworkEOL) {
+        var shouldSendUpdate = ((forceSend + '').toLowerCase() == 'true' || this.send_updates);
+        if (!shouldSendUpdate || !(this.orderGR && this.orderGR.isValidRecord()))
+            return false;
+
+        var payload = {
+            SendingSystem: "ABSPL",
+            EOLNumber: reworkEOL || this.orderGR.eol_number + '',
+            OrderStatus: this.status,
+            StatusMessage: this.statusMessage,
+            ServiceRequest: this.orderGR.service_request_number.getDisplayValue()
+        };
+
+        this.LOG.push('Sending "' + payload.OrderStatus + '" status to ' + this.system + ' for rework EOL ' + payload.EOLNumber);
+
+        if (includeLines && (includeLines + '').toLowerCase() == 'true') {
+            var lineTable = 'x_att2_abs_procure_abspl_order_sub_line_item';
+            var lineFields = [
+                ['SourceSystemLineItemNumber', 'order_line_key.source_system_line_item_number'],
+                ['ConfigurationSequenceNumber', 'order_line_key.configuration_sequence_number'],
+                ['SerialNumber', 'serial_number'],
+                ['Manufacturer', 'order_line_key.manufacturer'],
+                ['ManufacturerPartNumber', 'order_line_key.manufacturer_part_number'],
+                ['ShippingType', 'shipping_type'],
+                ['ShippingCarrier', 'shipping_carrier'],
+                ['TrackingNumber', 'tracking_number'],
+                ['ShippedDate', 'shipping_date'],
+                ['AssetTag', 'asset_tag'],
+                ['MacAddress', 'asset.mac_address'],
+                ['PONumber', ''],
+                ['Status', 'state'],
+                ['LineSysId', 'order_line_key.sys_id']
+            ];
+            payload.LineItems = this._getItemsArray(lineTable, lineFields);
+
+            if (linesMatchOrder)
+                for (var lmIdx = 0; lmIdx < payload.LineItems.length; lmIdx++)
+                    payload.LineItems[lmIdx].Status = payload.OrderStatus;
+        }
+
+        this._sendREST(payload, this._appConfig.status_rest_message, this._appConfig.status_rest_method);
+    },
+
+    sendAcceptRejectEOL: function(includeLines) {
+        var pvtOrder = "false";
+        if (this.orderGR.order_summary_key && this.orderGR.order_summary_key.service_line.name == "PVT")
+            pvtOrder = "true";
+
+        var payload = {
+            SendingSystem: "ABSPL",
+            EOLNumber: this.orderGR.eol_number + '',
+            Status: this.status,
+            StatusMessage: this.statusMessage,
+            TestEOL: pvtOrder,
+            OrderType: this.orderGR.order_type.getDisplayValue(),
+            ServiceRequest: this.orderGR.service_request.getDisplayValue()
+        };
+
+        if (this.status == 'Error')
+            payload.Errors = this.orderGR.error_json.nil() ? [] : JSON.parse(this.orderGR.error_json + '');
+
+        if (includeLines && (includeLines + '').toLowerCase() == 'true') {
+            var lineTable = 'x_att2_abs_procure_stage_order_line_item';
+            var lineFields = [
+                ['LineItemAction', 'line_item_action'],
+                ['SourceSystemLineItemNumber', 'source_system_line_item_number'],
+                ['ManufacturerPartNumber', 'manufacturer_part_number'],
+                ['Manufacturer', 'manufacturer'],
+                ['Status', 'processing_status']
+            ];
+
+            payload.LineItems = this._getItemsArray(lineTable, lineFields);
+        }
+
+        this._sendREST(payload, this._appConfig.accept_reject_rest_message, this._appConfig.accept_reject_rest_method);
+    },
+
+    sendAlert: function( /*ABSPLAlerts*/ alertObj, /*String*/ detail, /*Boolean*/ allowRepeat) {
+        if (!this.send_updates || !(this.orderGR && this.orderGR.isValidRecord()))
+            return false;
+
+        var code = alertObj.code || this.statusCode;
+        var message = alertObj.msg || this.statusMessage;
+        if (detail)
+            message += (': ' + detail);
+        var orderTable = this.orderGR.getTableName();
+        this.setStatus(null, message, code);
+
+        var _localOrderGR = new GlideRecord(orderTable);
+        _localOrderGR.get(this.orderGR.sys_id);
+
+        var sent_alerts = [];
+        if (orderTable == 'x_att2_abs_procure_abspl_order_summary' && !_localOrderGR.alerts_sent.nil())
+            sent_alerts = _localOrderGR.alerts_sent.toString().split(',');
+        else if (orderTable == 'x_att2_abs_procure_stage_order_summary' && !_localOrderGR.error_codes.nil())
+            sent_alerts = _localOrderGR.error_codes.toString().split(',');
+
+        if (allowRepeat === false && sent_alerts.includes(code + ''))
+            return;
+
+        if (!this._appConfig) {
+            new ABSPLCommonUtil().updateProcessingLog(_localOrderGR, ['Unable to send alert, no app config found for "' + this.orderGR.sending_system, 'Attempted alert: (' + code + ') "' + message + '"']);
+            return;
+        }
+
+        if (!sent_alerts.includes(code + ''))
+            sent_alerts.push(code + '');
+
+        if (orderTable == 'x_att2_abs_procure_abspl_order_summary') {
+            _localOrderGR.alerts_sent = sent_alerts.join(',');
+            _localOrderGR.setWorkflow(false);
+            _localOrderGR.update();
+        }
+
+        var payload = {
+            SendingSystem: "ABSPL",
+            EOLNumber: _localOrderGR.eol_number + '',
+            AlertCode: code,
+            AlertMessage: message,
+            OrderType: _localOrderGR.order_type.getDisplayValue()
+        };
+
+        if (orderTable == 'x_att2_abs_procure_abspl_order_summary')
+            payload.ServiceRequest = _localOrderGR.service_request_number.service_request + '';
+        else if (orderTable == 'x_att2_abs_procure_stage_order_summary') {
+            payload.ServiceRequest = _localOrderGR.service_request + '';
+            if (this.status == 'Error')
+                payload.Errors = _localOrderGR.error_json.nil() ? [] : JSON.parse(_localOrderGR.error_json + '');
+        }
+
+        this._sendREST(payload, this._appConfig.alert_rest_message, this._appConfig.alert_rest_method);
+    },
+
+    sendReturnInitiated: function() {
+        var payload = {
+            SendingSystem: "ABSPL",
+            ServiceRequest: this.orderGR.service_request_number.getDisplayValue(),
+            EOLNumber: this.orderGR.eol_number + '',
+            Status: 'Return Initiated'
+        };
+
+        this.setStatus(null, 'Return Initiated', 100);
+
+        // Adding this very special condition and OriginalEOLNumber due to an IBM requirement -- yes, it will always be identical to the EOLNumber attribute
+        if (!this.orderGR.related_order.nil() && this.orderGR.related_order.eol_number.toString() == this.orderGR.eol_number.toString())
+            payload.OriginalEOLNumber = this.orderGR.related_order.eol_number + '';
+
+        this._sendREST(payload, this._appConfig.return_rest_message, this._appConfig.return_rest_method);
+    },
+
+    sendReturnUpdated: function() {
+        if (!this.send_updates || !(this.orderGR && this.orderGR.isValidRecord()))
+            return false;
+
+        this.setStatus(null, 'Return Updated', 100);
+
+        var payload = {
+            SendingSystem: "ABSPL",
+            ServiceRequest: this.orderGR.service_request_number.getDisplayValue(),
+            EOLNumber: this.orderGR.eol_number + ''
+        };
+
+        // Adding this very special condition and OriginalEOLNumber due to an IBM requirement -- yes, it will always be identical to the EOLNumber attribute
+        if (!this.orderGR.related_order.nil() && this.orderGR.related_order.eol_number.toString() == this.orderGR.eol_number.toString())
+            payload.OriginalEOLNumber = this.orderGR.related_order.eol_number + '';
+
+        var lineTable = 'x_att2_abs_procure_abspl_order_sub_line_item';
+        var lineFields = [
+            ['SourceSystemLineItemNumber', 'order_line_key.source_system_line_item_number'],
+            ['ConfigurationSequenceNumber', 'order_line_key.configuration_sequence_number'],
+            ['SerialNumber', 'serial_number'],
+            ['Manufacturer', 'order_line_key.manufacturer'],
+            ['ManufacturerPartNumber', 'order_line_key.manufacturer_part_number'],
+            ['AssetTag', 'asset_tag'],
+            ['MacAddress', 'asset.mac_address'],
+            ['Status', 'state'],
+            ['LineSysId', 'order_line_key.sys_id']
+        ];
+        payload.LineItems = this._getItemsArray(lineTable, lineFields);
+
+        this._sendREST(payload, this._appConfig.return_rest_message, this._appConfig.return_rest_method);
+    },
+
+    sendReturnCompleted: function() {
+        if (!this.send_updates || !(this.orderGR && this.orderGR.isValidRecord()))
+            return false;
+
+        this.setStatus(null, 'Return Completed', 100);
+
+        var payload = {
+            SendingSystem: "ABSPL",
+            ServiceRequest: this.orderGR.service_request_number.getDisplayValue(),
+            EOLNumber: this.orderGR.eol_number + ''
+        };
+
+        // Adding this very special condition and OriginalEOLNumber due to an IBM requirement -- yes, it will always be identical to the EOLNumber attribute
+        if (!this.orderGR.related_order.nil() && this.orderGR.related_order.eol_number.toString() == this.orderGR.eol_number.toString())
+            payload.OriginalEOLNumber = this.orderGR.related_order.eol_number + '';
+
+        var lineTable = 'x_att2_abs_procure_abspl_order_sub_line_item';
+        var lineFields = [
+            ['SourceSystemLineItemNumber', 'order_line_key.source_system_line_item_number'],
+            ['ConfigurationSequenceNumber', 'order_line_key.configuration_sequence_number'],
+            ['SerialNumber', 'serial_number'],
+            ['Manufacturer', 'order_line_key.manufacturer'],
+            ['ManufacturerPartNumber', 'order_line_key.manufacturer_part_number'],
+            ['AssetTag', 'asset_tag'],
+            ['MacAddress', 'asset.mac_address'],
+            ['Status', 'state'],
+            ['LineSysId', 'order_line_key.sys_id']
+        ];
+        payload.LineItems = this._getItemsArray(lineTable, lineFields);
+
+        this._sendREST(payload, this._appConfig.return_rest_message, this._appConfig.return_rest_method);
+    },
+
+    getPurchaseReq: function() {
+        var reqGR = new GlideRecord('x_att2_abs_procure_purchase_requisition');
+        reqGR.addQuery('order_summary_key', this.orderGR.sys_id);
+        reqGR.query();
+        if (reqGR.next())
+            return reqGR;
+        else
+            return null;
+    },
+
+    _getItemsArray: function(table, fields) {
+        if (!(this.orderGR && this.orderGR.isValidRecord()))
+            return [];
+
+        if (!(table && fields && fields.length))
+            return [];
+
+        var parentField;
+
+        var appDateFormat = this._appConfig.date_format || 'yyyy-MM-dd';
+
+        if (table == 'x_att2_abs_procure_abspl_order_sub_line_item')
+            parentField = 'order_summary_key';
+        else if (table == 'x_att2_abs_procure_abspl_order_line_item')
+            parentField = 'order_summary_key';
+        else if (table == 'x_att2_abs_procure_stage_order_line_item')
+            parentField = 'staging_order';
+        else
+            return [];
+
+        var linesArr = [];
+        var lineGR = new GlideRecord(table);
+        lineGR.addQuery(parentField, this.orderGR.sys_id);
+        lineGR.query();
+        while (lineGR.next()) {
+            var lineObj = {};
+
+            fields.forEach(function(fieldPair) {
+                if (!(Array.isArray(fieldPair) && fieldPair.length > 0))
+                    return;
+
+                if (fieldPair.length > 1 && fieldPair[1]) {
+                    var fieldType = getFieldType(lineGR, fieldPair[1]);
+
+                    if (fieldType == 'glide_date') {
+                        lineObj[fieldPair[0]] = lineGR.getElement(fieldPair[1]).getGlideObject().getByFormat(appDateFormat);
+                    } else if (fieldType == 'glide_date_time') {
+                        var fieldDateGD = new GlideDate();
+                        fieldDateGD.setValue(lineGR.getValue(fieldPair[1]));
+                        lineObj[fieldPair[0]] = fieldDateGD.getByFormat(appDateFormat + " HH:mm:ss") + ' (GMT)';
+                    } else {
+                        lineObj[fieldPair[0]] = lineGR.getDisplayValue(fieldPair[1]) || '';
+                    }
+                } else {
+                    lineObj[fieldPair[0]] = '';
+                }
+            });
+
+            if (table == 'x_att2_abs_procure_stage_order_line_item') {
+                lineObj.Status = lineObj.Status == 'Error' ? 'Error' : 'Success';
+                if (lineObj.Status == 'Success')
+                    lineObj.StatusMessage = 'Successfully processed the line item';
+                else
+                    lineObj.StatusMessage = 'Line item validation failed';
+
+                if (lineObj.Status == 'Error')
+                    lineObj.Errors = lineGR.error_json.nil() ? [] : JSON.parse(lineGR.error_json + '');
+            }
+
+            linesArr.push(lineObj);
+        }
+        return linesArr;
+
+        function getFieldType(record, field) {
+            try {
+                var glideElement = record.getElement(field).getED().getInternalType();
+                return glideElement;
+            } catch (ex) {
+                return 'unknown';
+            }
+        }
+    },
+
+    _getSummaryLinePO: function(model) {
+        var prObj = {
+            number: '',
+            status: '',
+            listPrice: ''
+        };
+        var prLineGR = new GlideRecord('x_att2_abs_procure_purchase_requisition_line_item');
+        prLineGR.addQuery('purchase_requisition.order_summary_key.eol_number', this.orderGR.eol_number);
+        prLineGR.addQuery('model.model_number', model);
+        prLineGR.query();
+        if (prLineGR.next() && !prLineGR.purchase_order.nil()) {
+            prObj.number = prLineGR.purchase_order.po_number + '';
+            prObj.status = prLineGR.purchase_order.po_status + '';
+            prObj.listPrice = prLineGR.list_unit_price + '';
+        }
+
+        return prObj;
+    },
+
+    _getReqItemsArray: function(reqID) {
+        if (!reqID)
+            return [];
+
+        var linesArr = [];
+        var purLineGR = new GlideRecord('x_att2_abs_procure_purchase_requisition_line_item');
+        purLineGR.addQuery('purchase_requisition', reqID);
+        purLineGR.query();
+        while (purLineGR.next()) {
+            //get line item status
+            var lineObj = {
+                PONumber: purLineGR.po_number + '',
+                POStatus: purLineGR.po_status.getDisplayValue(),
+                POLineNumber: purLineGR.po_line_number + ''
+            };
+            linesArr.push(lineObj);
+        }
+        return linesArr;
+    },
+
+    _sendREST: function(jsonBody, restMessage, restMethod) {
+        if (!restMessage)
+            throw new Error('No REST message defined for this application');
+
+        if (!restMethod)
+            throw new Error('No REST method defined for this application');
+
+        var base_url;
+        var instanceType = new ABSPLCommonUtil().getInstanceType();
+
+        if (instanceType == 'PROD')
+            base_url = this._appConfig.base_url;
+        else if (instanceType == 'TEST')
+            base_url = this._appConfig.base_url_test;
+        else
+            base_url = this._appConfig.base_url_dev;
+
+        if (!base_url)
+            throw new Error('Base endpoint URL not found. Cannot send message ' + restMessage + '/' + restMethod + ' to ' + this.system);
+
+        var req = new sn_ws.RESTMessageV2(restMessage, restMethod);
+        req.setRequestBody(JSON.stringify(jsonBody));
+        req.setRequestHeader('Accept', 'application/json');
+        req.setStringParameterNoEscape('base_url', base_url);
+
+        //Log Integration Details
+        var integrationLog = new x_att2_abs_procure.ABSPLIntegrationLog(this.system, "Outbound", "REST");
+        integrationLog.setTableInstance(this.orderGR.getTableName(), this.orderGR.getUniqueValue());
+        integrationLog.setRequest('Post', req.getRequestBody(), req.getEndpoint(), restMessage, restMethod, req.getRequestHeaders());
+
+        try {
+            var response = req.execute();
+            integrationLog.setEndpoint(req.getEndpoint());
+            var httpCode = response.getStatusCode() + '';
+            var responseBodyStr = response.getBody();
+            var responseBody = {};
+            if (this._isValidJSON(responseBodyStr)) {
+                responseBody = JSON.parse(responseBodyStr);
+                Object.keys(responseBody).forEach(function(k) {
+                    if (!responseBody.hasOwnProperty(k.toLowerCase())) {
+                        responseBody[k.toLowerCase()] = responseBody[k];
+                        delete responseBody[k];
+                    }
+                });
+            }
+
+            var responseStatus = responseBody.status || httpCode;
+            var hasError = httpCode.charAt(0) != '2' || (responseBody.status && responseBody.status.toLowerCase() != 'success');
+
+            if (!hasError) {
+                this.LOG.push('Message successfully sent to ' + this.system + ' (Status: ' + responseStatus + ')');
+                this.LOG.push('"' + this.statusMessage + '"');
+                integrationLog.setLogStatus('Processed');
+            } else {
+                this.LOG.push('Message attempted to ' + this.system + ' (Status: ' + responseStatus + '): "' + this.statusMessage + '"');
+                var interTask = this._createInterventionTask(this.orderGR, responseBodyStr, integrationLog.getLogSysID());
+                if (interTask){
+                    this.LOG.push('Task created for manual intervention: ' + interTask.number);
+					}
+                integrationLog.setLogStatus('Error');
+            }
+        } catch (ex) {
+            this.LOG.push('ABSPLOrderStatus._sendREST Error');
+            this.LOG.push('"' + ex + '"');
+            integrationLog.setLogStatus('Error');
+        } finally {
+            if (responseBodyStr && httpCode)
+                integrationLog.setResponse(responseBodyStr, httpCode);
+            integrationLog.update();
+        }
+    },
+
+    _createInterventionTask: function(orderGR, msg, logSysId) {
+        var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+        taskGR.initialize();
+        taskGR.assignment_group = this._errGrp;
+        taskGR.task_type = 'Integration Error';
+        taskGR.short_description = 'Upstream system status update problem';
+        if (orderGR && orderGR.isValidRecord()) {
+            taskGR.short_description += ' for ' + orderGR.getDisplayValue() + ' (' + orderGR.getClassDisplayValue() + ')';
+            taskGR.order_summary = orderGR.sys_id + "";
+        }
+        taskGR.description = "There was a problem attempting to send a status update to " + this.system + " for this order. See order processing log for more details (if available).";
+        if (msg)
+            taskGR.description += ('\n"' + msg + '"');
+        if (logSysId)
+            taskGR.description += ('\n\n' + gs.getProperty('glide.servlet.uri') + 'x_att2_abs_procure_integration_log.do?sys_id=' + logSysId);
+        taskGR.insert();
+        return {
+            number: taskGR.number + '',
+            sys_id: taskGR.sys_id + ''
+        };
+    },
+
+    _isValidJSON: function(strJson) {
+        try {
+            JSON.parse(strJson);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    },
+
+    type: 'ABSPLOrderStatus'
+};
