@@ -1,0 +1,532 @@
+var ABSPLOrderStateFlow = Class.create();
+ABSPLOrderStateFlow.prototype = {
+    initialize: function(order) {
+        if (!order)
+            throw new Error('Cannot initialize ABSPLOrderStateFlow prototype: must provide order sys_id');
+
+        var orderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+        if (typeof order == 'string' && orderGR.get(order))
+            this.orderGR = orderGR;
+        else if (order.sys_id && orderGR.get(order.sys_id))
+            this.orderGR = orderGR;
+        else
+            throw new Error('Cannot initialize ABSPLOrderStateFlow prototype: must provide order sys_id');
+    },
+
+    updateOrderState: function(pState, pSubstate) {
+
+        if (!(this.orderGR && this.orderGR.isValidRecord()))
+            throw new Error('orderGR is not defined');
+
+        var currentState = this.orderGR.state + '',
+            currentSubstate = this.orderGR.substate + '',
+            newState = pState || currentState,
+            newSubstate = pSubstate || currentSubstate,
+            orderType = this.orderGR.order_type.toString().toLowerCase();
+
+        if (pState && pSubstate) {
+            this._setStateAndSubstate(pState, pSubstate);
+            this.orderGR.update();
+            return;
+        }
+
+        if (currentState == 'Cancelled' || currentState == 'Pending Cancellation')
+            return;
+
+        if (currentState == 'Complete') {
+            if (currentSubstate == 'Installed' || currentSubstate == 'Returned')
+                return;
+        }
+
+        var lineStates = this._getLineStateCounts();
+        var subLineStates = this._getSubLineStateCounts();
+
+        if (!lineStates.list || !subLineStates.list || lineStates.list.length == 0 || subLineStates.list.length == 0)
+            return;
+
+        if (lineStates.list.includes('New') || subLineStates.list.includes('New'))
+            return;
+
+        if (lineStates.list.includes('Open') || subLineStates.list.includes('Draft')) {
+            if (orderType != 'new' || !lineStates.agree || !subLineStates.agree)
+                return;
+        }
+
+        var commUtil = new ABSPLCommonUtil();
+        var ecUtil = new ABSPLExportCompliance(this.orderGR);
+
+        if (orderType == 'new') {
+            var partialStock = (subLineStates.list.includes('Out of Stock') && subLineStates.list.includes('Reserved') && subLineStates.list.length == 2);
+            if (subLineStates.list.includes('Out of Stock') && (partialStock || lineStates.agree)) {
+                var csItemGR = new GlideRecord('x_att2_abs_procure_abspl_order_line_item');
+                csItemGR.addQuery('order', this.orderGR.sys_id);
+                csItemGR.addQuery('ownership', 'C'); //Customer Supplied
+                csItemGR.query();
+                if (csItemGR.hasNext()) {
+                    // cannot process customer supplied EOL
+                    this._setStateAndSubstate('Open', 'Under Review');
+                    this.orderGR.update();
+                    return;
+                }
+
+                if (this.orderGR.staged + '' == 'false') {
+                    var openPOGR = new GlideRecord('x_att2_abs_procure_purchase_requisition');
+                    openPOGR.addQuery('order_summary_key', this.orderGR.sys_id);
+                    openPOGR.query();
+                    while (openPOGR.next()) {
+                        //Validate Ship To CLLI is not a CTDI Warehouse
+                        var ctdiWarehouse = new GlideRecord('x_att2_abs_procure_warehouse_to_country_map');
+                        if (!ctdiWarehouse.get('clli_code', openPOGR.ship_to_clli) && (openPOGR.state + '' == 'Ordered' || openPOGR.state + '' == 'Closed')) {
+                            if (this.orderGR.substate == 'Out of Stock' || this.orderGR.substate == 'Partial Stock') {
+                                this._setStateAndSubstate('Open', 'Ordered');
+                                this.orderGR.update();
+                            } else if (this.orderGR.substate == 'Ordered') {
+
+                                //Check if the Receive the order in NC3 task has been completed
+                                var openTask = new GlideRecord('x_att2_abs_procure_abs_order_task');
+                                openTask.addQuery('order_summary', this.orderGR.sys_id);
+                                openTask.addQuery('task_type', 'Receive Order in NC3');
+                                openTask.addQuery('state', '3'); //Closed Complete
+                                openTask.query();
+                                if (openTask.hasNext()) {
+                                    this._setStateAndSubstate('Shipped', 'Pending Activation');
+                                    this.orderGR.update();
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if (currentState != 'Check 1' && ecUtil.isExportComplianceRequired('Check 1') && this.orderGR.check_1_processed + '' == 'false') {
+                this._setStateAndSubstate('Check 1', 'Compliance Pending');
+                this.orderGR.update();
+                return;
+            }
+
+            if (lineStates.agree) {
+                // all lines are the same state
+
+                switch (lineStates.agreedState) {
+                    case 'Draft':
+                        if (this.orderGR.check_1_processed + '' == 'false' && ecUtil.isExportComplianceRequired('Check 1')) {
+                            this._setStateAndSubstate('Check 1', 'Compliance Pending');
+                        } else {
+                            // Trigger reservation rules by setting sub line states to 'New'
+                            commUtil.updateProcessingLog(this.orderGR, 'Running reservation rules');
+                            commUtil.setAllLineAndSublineItems(this.orderGR, 'New', 'New');
+                            var _localOrderGR = new GlideRecord(this.orderGR.getTableName());
+                            if (_localOrderGR.get(this.orderGR.sys_id) && (_localOrderGR.state.toString() == 'Open' || _localOrderGR.substate.nil()))
+                                this.updateOrderState(); // *CAUTION* Recursion -- DO NOT copy carelessly
+                            return;
+                        }
+                        break;
+
+                    case 'Reserved':
+                        if (this.orderGR.check_1_processed + '' == 'false' && ecUtil.isExportComplianceRequired('Check 1'))
+                            this._setStateAndSubstate('Check 1', 'Compliance Pending');
+                        else if (ABSPLFileUtil.isAwaitingDocs(this.orderGR))
+                            this._setStateAndSubstate('Open', 'Pending Documentation');
+                        else
+                            this._setStateAndSubstate('Pending CTDI', 'Picking');
+
+                        break;
+
+                    case 'Installed':
+                        this._setStateAndSubstate('Complete', 'Installed');
+                        break;
+
+                    case 'Picking':
+                        this._setStateAndSubstate('Pending CTDI', 'Picking');
+                        break;
+
+                    case 'Picked':
+                        this._setStateAndSubstate('Pending CTDI', 'Staging');
+                        break;
+
+                    case 'Out of Stock':
+                        this._setStateAndSubstate('Open', 'Out of Stock');
+                        if (this.orderGR.staged + '' == 'false') {
+                            commUtil.copyAddressesForDirectShip(this.orderGR);
+                            commUtil.updateProcessingLog(this.orderGR, 'Order is fully out of stock and will be direct shipped on PO. "Ship To" updated to match "Mark For", previous "Ship To" copied into "Alternate Ship To".');
+                        }
+                        break;
+
+                    case 'Partial Stock':
+                        this._setStateAndSubstate('Open', 'Partial Stock');
+                        break;
+
+                    case 'Cancelled':
+                        this._setStateAndSubstate('Cancelled', 'Cancelled');
+                        break;
+
+                    case 'Staging':
+                        this._setStateAndSubstate('Pending CTDI', 'Staging');
+                        break;
+
+                    case 'Staged':
+                        if (ecUtil.isExportComplianceRequired('Check 2')) {
+                            if (commUtil.requiresICPO(this.orderGR) && !commUtil.hasProcessedICPO(this.orderGR)) {
+                                this._setStateAndSubstate('Open', 'Pending ICPO');
+                            } else {
+                                if (this.orderGR.check_2_processed + '' == 'false')
+                                    this._setStateAndSubstate('Check 2', 'Compliance Pending');
+                                else
+                                    this._setStateAndSubstate('Pending CTDI', 'Shipping');
+                            }
+                        } else {
+                            this._setStateAndSubstate('Pending CTDI', 'Shipping');
+                        }
+                        break;
+
+                    case 'Shipping':
+                        this._setStateAndSubstate('Pending CTDI', 'Shipping');
+                        break;
+
+                    case 'Shipped':
+                        this._setStateAndSubstate('Shipped', 'Pending Activation');
+                        break;
+
+                    case 'Complete':
+                        this._setStateAndSubstate('Complete', 'Installed');
+                        break;
+
+                    case 'Compliance Processed':
+                        this.refreshLineStates();
+                        break;
+
+                    case 'Compliance Pending':
+                        if (this.orderGR.check_1_processed + '' == 'false')
+                            this._setStateAndSubstate('Check 1', 'Compliance Pending');
+                        else if (this.orderGR.check_2_processed + '' == 'false')
+                            this._setStateAndSubstate('Check 2', 'Compliance Pending');
+                        break;
+
+                    case 'Compliance Hold':
+                        if (currentState == 'Check 1' || currentState == 'Check 2')
+                            this._setStateAndSubstate(currentState, lineStates.agreedState);
+                        break;
+
+                    case 'Compliance Error':
+                        if (currentState == 'Check 1' || currentState == 'Check 2')
+                            this._setStateAndSubstate(currentState, lineStates.agreedState);
+                        break;
+
+                    case 'Pending ICPO':
+                        if (commUtil.requiresICPO(this.orderGR) && !commUtil.hasProcessedICPO(this.orderGR)) {
+                            this._setStateAndSubstate('Open', 'Pending ICPO');
+                        } else {
+                            if (commUtil.isExportComplianceRequired() && this.orderGR.check_2_processed + '' == 'false') {
+                                this._setStateAndSubstate('Check 2', 'Compliance Pending');
+                                commUtil.setAllLineAndSublineItems(this.orderGR, 'Staged', 'Staged');
+                            } else {
+                                this._setStateAndSubstate('Pending CTDI', 'Shipping');
+                            }
+                        }
+                        break;
+
+                    case 'Needs Review':
+                        this._setStateAndSubstate('Open', 'Under Review');
+                        break;
+
+                    default:
+                        break;
+                }
+            } else if (partialStock) {
+                // At least 1 but not all states are "Out of Stock", set to Open/Partial Stock
+                this._setStateAndSubstate('Open', 'Partial Stock');
+            } else if (lineStates.list.includes('Installed')) {
+                if (!commUtil.isAwaitingKeyItems(this.orderGR)) {
+                    this._setStateAndSubstate('Complete', 'Installed');
+                }
+            } else if (currentState == 'Check 1' || currentState == 'Check 2') {
+                // Check for compliance substates
+                if (lineStates.list.includes('Compliance Error'))
+                    this._setStateAndSubstate(currentState, 'Compliance Error');
+                else if (lineStates.list.includes('Compliance Hold'))
+                    this._setStateAndSubstate(currentState, 'Compliance Hold');
+            } else {
+                // mixed states with no other use-case -- do nothing
+                return;
+            }
+        }
+
+        if (orderType == 'return') {
+            if (lineStates.list.includes('Complete')) {
+                if (this.orderGR.equipment_retrieval_process.toString().indexOf('Return to Warehouse') >= 0) {
+                    if (!commUtil.isAwaitingKeyItems(this.orderGR)) {
+                        var keyStates = commUtil.getKeyItemStates(this.orderGR);
+                        if (keyStates.list.includes('Not Recovered'))
+                            this._setStateAndSubstate('Complete', 'Not Returned');
+                        else
+                            this._setStateAndSubstate('Complete', 'Returned');
+                    } else if (lineStates.agree) {
+                        this._setStateAndSubstate('Complete', 'Pending Return');
+                    } else if (currentState == 'Open' || currentSubstate == 'New') {
+                        this._setStateAndSubstate('In Progress', 'Pending Return');
+                    }
+                } else {
+                    if (lineStates.agree) {
+                        this._setStateAndSubstate('Complete', 'Disposed');
+                    }
+                }
+            } else if (lineStates.list.includes('Needs Review')) {
+                this._setStateAndSubstate('Open', 'Under Review');
+            } else if (lineStates.list.includes('Pending Return')) {
+                this._setStateAndSubstate('In Progress', 'Pending Return');
+            } else if (lineStates.agree) {
+                switch (lineStates.agreedState) {
+                    case 'Needs Review':
+                        this._setStateAndSubstate('Open', 'Under Review');
+                        break;
+
+                    case 'Pending Return':
+                        this._setStateAndSubstate('In Progress', 'Pending Return');
+                        break;
+
+                    case 'Pending Disposition':
+                        this._setStateAndSubstate('Pending CTDI', 'Pending Disposition');
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+        }
+        this.orderGR.update();
+    },
+
+    refreshLineStates: function() {
+        var lineGR = new GlideRecord('x_att2_abs_procure_abspl_order_line_item');
+        lineGR.addQuery('order', this.orderGR.sys_id);
+        lineGR.query();
+        while (lineGR.next())
+            ABSPLOrderStateFlow.updateLineState(lineGR);
+    },
+
+    _getLineStateCounts: function() {
+        var stateCounts = {
+            agree: false,
+            agreedState: '',
+            list: []
+        };
+
+        var lineGA = new GlideAggregate('x_att2_abs_procure_abspl_order_line_item');
+        lineGA.addQuery('order', this.orderGR.sys_id);
+        lineGA.addQuery('state', '!=', 'Cancelled');
+        lineGA.groupBy('state');
+        lineGA.addAggregate('COUNT');
+        lineGA.query();
+        while (lineGA.next()) {
+            stateCounts[lineGA.state + ''] = lineGA.getAggregate('COUNT');
+            stateCounts.list.push(lineGA.state + '');
+        }
+
+        if (stateCounts.list.length == 1) {
+            stateCounts.agree = true;
+            stateCounts.agreedState = stateCounts.list[0];
+        }
+
+        return stateCounts;
+    },
+
+    _getSubLineStateCounts: function() {
+        var stateCounts = {
+            agree: false,
+            agreedState: '',
+            list: []
+        };
+
+        var subLineGA = new GlideAggregate('x_att2_abs_procure_abspl_order_sub_line_item');
+        subLineGA.addQuery('order_summary_key', this.orderGR.sys_id);
+        subLineGA.addQuery('state', '!=', 'Cancelled');
+        subLineGA.groupBy('state');
+        subLineGA.addAggregate('COUNT');
+        subLineGA.query();
+        while (subLineGA.next()) {
+            stateCounts[subLineGA.state + ''] = subLineGA.getAggregate('COUNT');
+            stateCounts.list.push(subLineGA.state + '');
+        }
+
+        if (stateCounts.list.length == 1) {
+            stateCounts.agree = true;
+            stateCounts.agreedState = stateCounts.list[0];
+        }
+
+        return stateCounts;
+    },
+
+    _setStateAndSubstate: function(state, substate) {
+        var validState = false,
+            validSubstate = false;
+
+        var orderState = this.orderGR.state + '',
+            orderSubstate = this.orderGR.substate + '';
+
+        if (state == orderState || !orderState || (this._validStateTransitions[orderState] && this._validStateTransitions[orderState].indexOf(state) >= 0))
+            validState = true;
+        if (substate == orderSubstate || !orderSubstate || (this._validSubstateTransitions[this.orderGR.substate + ''] && this._validSubstateTransitions[this.orderGR.substate + ''].indexOf(substate) >= 0))
+            validSubstate = true;
+
+        // if (validState && validSubstate) { // REMOVED FOR NOW, until we can finalize state transitions
+        this.orderGR.state = state;
+        this.orderGR.substate = substate;
+        //} else {
+        //    throw new Error('Invalid state or substate transition');
+        //}
+    },
+
+    _validStateTransitions: {
+        "Draft": ["Open", "Check 1", "Pending CTDI"],
+        "Open": ["Check 1", "Pending CTDI"],
+        "Check 1": ["Pending CTDI", "Open"],
+        "Pending CTDI": ["Check 2", "Shipped"],
+        "Check 2": ["Shipped"]
+    },
+
+    _validSubstateTransitions: {
+        "Draft": ["Open", "Compliance Pending", "Out of Stock", "Partial Stock"],
+        "Compliance Pending": ["Compliance Hold", "Compliance Error", "Out of Stock", "Partial Stock", "Picking"],
+        "Compliance Hold": ["Compliance Hold", "Compliance Error", "Out of Stock", "Partial Stock", "Picking"],
+        "Compliance Error": ["Compliance Hold", "Compliance Error", "Out of Stock", "Partial Stock", "Picking"],
+        "Out of Stock": ["Compliance Hold", "Compliance Error", "Out of Stock", "Partial Stock", "Picking"],
+        "Partial Stock": ["Compliance Hold", "Compliance Error", "Out of Stock", "Partial Stock", "Picking"],
+    },
+
+    type: 'ABSPLOrderStateFlow'
+};
+
+ABSPLOrderStateFlow.updateLineState = function(lineGR) {
+    if (!(lineGR && lineGR.isValidRecord()))
+        return;
+
+    if (lineGR.order.state.toString() == 'Cancelled') {
+        lineGR.state = 'Cancelled';
+        lineGR.update();
+        return;
+    }
+
+    var ec = new ABSPLExportCompliance(lineGR.order + '');
+    var compReq = ec.isExportComplianceRequired();
+
+    var stateCounts = {};
+
+    var subLineGA = new GlideAggregate('x_att2_abs_procure_abspl_order_sub_line_item');
+    subLineGA.addQuery('order_line_key', lineGR.sys_id);
+    subLineGA.groupBy('state');
+    subLineGA.addAggregate('COUNT');
+    subLineGA.query();
+    while (subLineGA.next())
+        stateCounts[subLineGA.state + ''] = subLineGA.getAggregate('COUNT');
+
+    var allStates = Object.keys(stateCounts);
+
+    // if all states agree except for cancelled, remove cancelled from array -- but we don't filter it out of the GA query, because we still want to cancel the line when all sub lines are cancelled
+    if (allStates.length == 2 && allStates.indexOf('Cancelled') >= 0)
+        allStates.splice(allStates.indexOf('Cancelled'), 1);
+
+    if (allStates.length == 1) {
+        // all of the states are the same or cancelled for this line -- update line state as necessary
+        var jointState = allStates[0];
+        switch (jointState) {
+            case 'Draft':
+                lineGR.state = 'Draft';
+                break;
+
+            case 'Reserved':
+                lineGR.state = 'Reserved';
+                break;
+
+            case 'Out of Stock':
+                lineGR.state = 'Out of Stock';
+                break;
+
+            case 'Picking':
+                lineGR.state = 'Picking';
+                break;
+
+            case 'Picked':
+                lineGR.state = 'Picked';
+                break;
+
+            case 'Staging':
+                lineGR.state = 'Staging';
+                break;
+
+            case 'Staged':
+                lineGR.state = 'Staged';
+                break;
+
+            case 'Shipping':
+                lineGR.state = 'Shipping';
+                break;
+
+            case 'Shipped':
+                lineGR.state = 'Shipped';
+                break;
+
+            case 'Pending ICPO':
+                lineGR.state = 'Pending ICPO';
+                break;
+
+            case 'Compliance Processed':
+                lineGR.state = 'Compliance Processed';
+                break;
+
+            case 'Pending Return':
+                lineGR.state = 'Pending Return';
+                break;
+
+            case 'Pending Disposition':
+                lineGR.state = 'Pending Disposition';
+                break;
+
+            case 'Complete':
+                lineGR.state = 'Complete';
+                break;
+
+            case 'Recovered':
+                lineGR.state = 'Complete';
+                break;
+
+            case 'Recovered Damaged':
+                lineGR.state = 'Complete';
+                break;
+
+            case 'Not Recovered':
+                lineGR.state = 'Complete';
+                break;
+
+            case 'Cancelled':
+                lineGR.state = 'Cancelled';
+                break;
+
+            case 'Installed':
+                lineGR.state = 'Installed';
+                break;
+
+            case 'Needs Review':
+                lineGR.state = 'Needs Review';
+                break;
+
+            default:
+                break;
+        }
+    } else if (allStates.indexOf('Out of Stock') >= 0 && allStates.indexOf('Picking') < 0) {
+        lineGR.state = 'Partial Stock';
+    } else if (lineGR.order.order_type + '' == 'return') {
+        var allComp = true;
+        var compStates = 'Recovered,Recovered Damaged,Not Recovered';
+        for (var recidx = 0; recidx < allStates.length; recidx++) {
+            if (!(compStates.indexOf(allStates[recidx]) >= 0)) {
+                allComp = false;
+                break;
+            }
+        }
+        if (allComp)
+            lineGR.state = 'Complete';
+    }
+
+    lineGR.update();
+};
