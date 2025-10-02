@@ -1,0 +1,53 @@
+(function executeRule(current, previous /*null when async*/ ) {
+    //Get return settings
+    var settings = new GlideRecord('x_att2_abs_procure_return_settings');
+    settings.addQuery('service_line', current.service_line + '').addOrCondition('service_line', '');
+    settings.addQuery('country', current.mark_for_country + '');
+    settings.addQuery('subtype', current.subtype + '').addOrCondition('subtype', '');
+    //settings.addQuery('tech_dispatch', current.tech_dispatch + '');
+    settings.orderByDesc('subtype');
+    settings.orderByDesc('service_line');
+    settings.query();
+    if (settings.next()) {
+        //Update next return reminder if the return settings are changing
+        if (current.return_setting != settings.sys_id && current.next_reminder_return) {
+            var reminders = []; //(settings.notification_days + '').split(',');
+			if(settings.remind_1_days) reminders.push(settings.remind_1_days + '');
+			if(settings.remind_2_days) reminders.push(settings.remind_2_days + '');
+
+            var now = new GlideDateTime();
+            now.setValue(now.getDate().getValue() + ' 12:00:00');
+            var reminder = new GlideDateTime(current.sys_created_on + '');
+            reminder.setValue(reminder.getDate().getValue() + ' 12:00:00');
+
+            current.next_reminder_return = '';
+            for (var r = 0; r < reminders.length && current.next_reminder_return == ''; r++) {
+                reminder.addDaysLocalTime(parseInt(reminders[r]));
+                if (reminder.compareTo(now) > 0) {
+                    current.next_reminder_return = reminder.getDate();
+                }
+            }
+        }
+        // If tech dispatch is set for a country, override whatever we get from upstream
+        if (settings.tech_dispatch) {
+            current.tech_dispatch = true;
+        }
+
+        // Set return deadline
+        var deadline = settings.max_num_days + '';
+        if (current.return_deadline == '' && deadline != '' && deadline != '0') {
+            var created = new GlideDateTime(current.sys_created_on + '');
+            created.addDaysLocalTime(parseInt(deadline));
+            current.return_deadline = created.getDate();
+        }
+
+        current.return_setting = settings.sys_id + '';
+    } else {
+        current.return_setting = '';
+        current.next_reminder_return = '';
+		current.return_deadline = '';
+        gs.info("No return setting found for " + current.eol_number);
+    }
+
+
+})(current, previous);
