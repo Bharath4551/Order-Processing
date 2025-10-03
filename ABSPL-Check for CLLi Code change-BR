@@ -1,0 +1,64 @@
+q. abspl-Check for CLLi Code change-BR
+
+(function executeRule(current, previous /*null when async*/) {
+
+	if (current.mark_for_clli.changes())
+		current.mark_for_clli_check = 'Pending';
+
+	if (current.ship_to_clli.changes())
+		current.ship_to_clli_check = 'Pending';
+
+})(current, previous);
+
+2.Validate cLLI codes
+
+(function executeRule(current, previous /*null when async*/ ) {
+
+	var LOG = [];
+	LOG.push('Checking CLLI codes in LMC...');
+    if (current.mark_for_clli_check == 'Pending') {
+        current.mark_for_clli_check = checkLMC(current.mark_for_clli);
+	}
+
+    if (current.ship_to_clli_check == 'Pending') {
+        current.ship_to_clli_check = checkLMC(current.ship_to_clli); 
+	}
+
+	new ABSPLCommonUtil().updateProcessingLog(current, LOG);
+
+	current.setWorkflow(false);
+	current.update();
+
+
+    function checkLMC(clliCode) {
+		var validCLLI = 'Pending';
+        var s = new sn_ws.SOAPMessageV2('x_att2_abs_procure.LMC', 'GET Details');
+
+        s.setStringParameterNoEscape('clli_code', clliCode);
+        var response = s.execute();
+        var responseBody = response.getBody();
+        var responsestatus = response.getStatusCode();
+
+        if (responsestatus != "200") {
+            LOG.push("LMC ENDPOINT NOT AVAILABLE. Cannot validate CLLI information");
+        } else {
+            var xmlDoc = new XMLDocument2();
+            xmlDoc.setNamespaceAware(true);
+            xmlDoc.parseXML(responseBody);
+
+            var resultCode = xmlDoc.getNodeText("//ns1:ResultCode");
+            // result codes are 0 for success and 100 for an error; the code does not return data;
+            if (resultCode != "0") {
+                validCLLI = 'Invalid';
+                LOG.push(clliCode + ' not found in LMC');
+            }
+            else {
+				validCLLI = 'Valid';
+                LOG.push(clliCode + ' found in LMC');
+            }
+        }
+
+		return validCLLI;
+    }
+
+})(current, previous);
