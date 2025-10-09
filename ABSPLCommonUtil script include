@@ -1,0 +1,392 @@
+var ABSPLCommonUtil = Class.create();
+
+ABSPLCommonUtil.prototype = {
+    initialize: function() {},
+
+    isJsonString: function(jsonStr) {
+        try {
+            JSON.parse(jsonStr);
+        } catch (e) {
+            return false;
+        }
+        return true;
+    },
+
+    updateProcessingLog: function(record, msgs) {
+        if (!msgs)
+            return;
+
+        if (record && record.isValidRecord()) {
+            var MULTI_MSG_DELIM = '  -> ';
+            var table = record.getTableName(),
+                sys_id = record.getUniqueValue();
+
+            var _localRecord = new GlideRecord(table);
+            if (_localRecord.get(sys_id)) {
+                _localRecord.processing_log += '\n\n';
+                if (typeof msgs == 'string') {
+                    _localRecord.processing_log += (msgs + ' -- ' + new GlideDateTime() + ' (GMT)');
+                } else if (Array.isArray(msgs)) {
+                    _localRecord.processing_log += (msgs.shift() + ' -- ' + new GlideDateTime() + ' (GMT)');
+                    if (msgs.length > 0)
+                        _localRecord.processing_log += ('\n' + MULTI_MSG_DELIM + msgs.join('\n' + MULTI_MSG_DELIM));
+                } else {
+                    return;
+                }
+
+                _localRecord.processing_log = _localRecord.processing_log.trim();
+
+                _localRecord.setWorkflow(false);
+                _localRecord.update();
+            }
+        } else {
+            throw new Error('Cannot update processing log: must provide a valid GlideRecord to update');
+        }
+    },
+
+    getInstanceStack: function() {
+        var instance = 'COMMERCIAL';
+        var instanceURL = gs.getProperty('instance_name');
+        if (instanceURL.indexOf('attgcc') >= 0)
+            instance = 'FEDGOV';
+
+        return instance;
+    },
+
+    getInstanceType: function() {
+        var instanceName = gs.getProperty('instance_name');
+
+        if (instanceName == 'attcomm' || instanceName == 'attgcc')
+            return "PROD";
+        else if (instanceName.contains('test') || instanceName.contains('perf') || instanceName.contains('beta') || instanceName.contains('qa'))
+            return "TEST";
+        else
+            return "DEV";
+
+    },
+
+    createOrderTask: function(orderGR, type, short_description, description, assignment_group_id) {
+        var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+        taskGR.initialize();
+        taskGR.assignment_group = assignment_group_id || '346fd9e093ff8ad44c18f8f17cba1039'; // Procurement Specialists
+        taskGR.task_type = type || 'Other';
+        taskGR.short_description = short_description;
+        if (orderGR && orderGR.isValidRecord())
+            taskGR.order_summary = orderGR.sys_id + "";
+        taskGR.description = description;
+        taskGR.insert();
+        return taskGR;
+    },
+
+    copyAddressesForDirectShip: function(orderGR) {
+        if (!orderGR.warehouse.nil()) {
+            // clear out warehouse since we're shipping direct
+            orderGR.warehouse = "";
+            if (!orderGR.alternate_ship_to_country.nil()) {
+                // Replace warehouse Ship To info with original Ship To info from the Alternate Ship To fields
+                orderGR.ship_to_site_id = orderGR.alternate_ship_to_address_site_id + "";
+                orderGR.ship_to_clli_code = orderGR.alternate_ship_to_address_clli_code + "";
+                orderGR.ship_to_city = orderGR.alternate_ship_to_address_city + "";
+                orderGR.ship_to_zip_code_or_postal_code = orderGR.alternate_ship_to_address_zip_code_or_postal_code + "";
+                orderGR.ship_to_street_address_line_1 = orderGR.alternate_ship_to_address_street_address_line_1 + "";
+                orderGR.ship_to_street_address_line_2 = orderGR.alternate_ship_to_address_street_address_line_2 + "";
+                orderGR.ship_to_country = orderGR.alternate_ship_to_country + "";
+                orderGR.ship_to_state_or_province = orderGR.alternate_ship_to_address_state_or_province + "";
+                orderGR.ship_to_contact_name = orderGR.alternate_ship_to_address_contact_name + "";
+                orderGR.ship_to_contact_phone_number = orderGR.alternate_ship_to_address_contact_phone_number + "";
+                orderGR.ship_to_company_name = orderGR.alternate_ship_to_company_name + "";
+            } else {
+                // No original Ship To info provided, replace warehouse Ship To info with Mark For info
+                orderGR.ship_to_site_id = orderGR.mark_for_site_id + "";
+                orderGR.ship_to_clli_code = orderGR.mark_for_clli_code + "";
+                orderGR.ship_to_city = orderGR.mark_for_city + "";
+                orderGR.ship_to_zip_code_or_postal_code = orderGR.mark_for_zip_code_or_postal_code + "";
+                orderGR.ship_to_street_address_line_1 = orderGR.mark_for_street_address_line_1 + "";
+                orderGR.ship_to_street_address_line_2 = orderGR.mark_for_street_address_line_2 + "";
+                orderGR.ship_to_country = orderGR.mark_for_country + "";
+                orderGR.ship_to_state_or_province = orderGR.mark_for_state_or_province + "";
+                orderGR.ship_to_contact_name = orderGR.mark_for_contact_name + "";
+                orderGR.ship_to_contact_phone_number = orderGR.mark_for_contact_phone_number + "";
+                orderGR.ship_to_company_name = orderGR.mark_for_company_name + "";
+            }
+        }
+    },
+
+    copyMarkForToShipTo: function(orderGR) {
+        orderGR.ship_to_clli_code = orderGR.mark_for_clli_code;
+        orderGR.ship_to_company_name = orderGR.mark_for_company_name;
+        orderGR.ship_to_contact_name = orderGR.mark_for_contact_name;
+        orderGR.ship_to_contact_e_mail = orderGR.mark_for_contact_e_mail;
+        orderGR.ship_to_contact_phone_number = orderGR.mark_for_contact_phone_number;
+        orderGR.ship_to_site_id = orderGR.mark_for_site_id;
+        orderGR.ship_to_street_address_line_1 = orderGR.mark_for_street_address_line_1;
+        orderGR.ship_to_street_address_line_2 = orderGR.mark_for_street_address_line_2;
+        orderGR.ship_to_city = orderGR.mark_for_city;
+        orderGR.ship_to_state_or_province = orderGR.mark_for_state_or_province;
+        orderGR.ship_to_zip_code_or_postal_code = orderGR.mark_for_zip_code_or_postal_code;
+        orderGR.ship_to_country = orderGR.mark_for_country;
+    },
+
+    hasOpenPurchaseReq: function(orderGR) {
+        var purchaseReq = new GlideRecord('x_att2_abs_procure_purchase_requisition');
+        purchaseReq.addQuery('order_summary_key', orderGR.sys_id);
+        purchaseReq.addQuery('state', 'IN', 'Draft,Submitted,Approved,Pending Review,Ordered');
+        purchaseReq.query();
+        return purchaseReq.hasNext();
+    },
+
+    hasOutOfStockItems: function(orderGR) {
+        var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+        subLineGR.addQuery('order_summary_key', orderGR.sys_id);
+        subLineGR.addQuery('state', 'Out of Stock');
+        subLineGR.query();
+        return subLineGR.hasNext();
+    },
+
+    allOutOfStock: function(orderGR) {
+        var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+        subLineGR.addQuery('order_summary_key', orderGR.sys_id);
+        subLineGR.addQuery('state', 'NOT IN', 'Out of Stock,Cancelled');
+        subLineGR.query();
+        return !subLineGR.hasNext();
+    },
+
+    requiresICPO: function(orderGR) {
+        return orderGR.isValidRecord() &&
+            !this.isUSTerritory(orderGR.mark_for_country.iso3166_2 + '') &&
+            (orderGR.ship_to_country.iso3166_2.toString() == 'US' ||
+                orderGR.warehouse.warehouse_country_location.iso3166_2.toString() == 'US');
+    },
+
+    hasPendingICPO: function(orderGR) {
+        var orderSummary = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+        orderSummary.addQuery('sys_id', orderGR.sys_id + '');
+        orderSummary.query();
+        if (orderSummary.next()) {
+            var icpoGR = new GlideRecord('x_att2_abs_procure_purchase_requisition');
+            icpoGR.addQuery('type', 'ICPO');
+            icpoGR.addQuery('state', 'NOT IN', 'Ordered,Cancelled,Closed');
+            icpoGR.addQuery('sys_id', orderSummary.icpo + '');
+            icpoGR.query();
+            return icpoGR.hasNext();
+        }
+    },
+
+    hasProcessedICPO: function(orderGR) {
+        var orderSummary = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+        orderSummary.addQuery('sys_id', orderGR.sys_id + '');
+        orderSummary.query();
+        if (orderSummary.next()) {
+            var icpoGR = new GlideRecord('x_att2_abs_procure_purchase_requisition');
+            icpoGR.addQuery('type', 'ICPO');
+            icpoGR.addQuery('state', 'IN', 'Ordered,Cancelled,Closed');
+            icpoGR.addQuery('sys_id', orderSummary.icpo + '');
+            icpoGR.query();
+            return icpoGR.hasNext();
+        }
+    },
+
+    setOrderSummaryIcpo: function(orderSysId, icpoSysId, prNumber, message) {
+        var orderSummary = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+        orderSummary.addQuery('sys_id', orderSysId + '');
+        orderSummary.query();
+        if (orderSummary.next()) {
+			orderSummary.processing_log += '\n\n' + prNumber + ' - ' + message + ' -- ' + new GlideDateTime() + ' (GMT)';
+            orderSummary.icpo = icpoSysId + '';
+            orderSummary.update();
+        }
+    },
+
+    check1CreateICPO: function(orderGR) {
+        var orderSummary = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+        orderSummary.addQuery('sys_id', orderGR + '');
+        orderSummary.query();
+        if (orderSummary.next())
+            var serviceRequest = orderSummary.service_request_number.service_request;
+
+        var query = 'type=ICPO^order_summary_key.service_request_number.service_request=' + serviceRequest;
+
+        var purchaseReq = new GlideRecord('x_att2_abs_procure_purchase_requisition');
+        purchaseReq.addEncodedQuery(query);
+        purchaseReq.query();
+        while (purchaseReq.next()) {
+            if (purchaseReq.state != 'Ordered')
+                return false;
+        }
+        return true;
+    },
+
+    isUSTerritory: function(country) {
+        return country && ['US', 'PR', 'GU', 'VI', 'AS', 'FM', 'MP'].includes(country + '');
+    },
+
+    hasPendingCOD: function(orderGR) {
+        if (!orderGR)
+            return false;
+
+        var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+        taskGR.addQuery('order_summary', orderGR.sys_id);
+        taskGR.addQuery('task_type', 'Certificate of Destruction');
+        taskGR.addQuery('active', 'true');
+        taskGR.query();
+        return taskGR.hasNext();
+    },
+
+    hasPendingIOSWipe: function(orderGR) {
+        if (!orderGR)
+            return false;
+
+        var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+        taskGR.addQuery('order_summary', orderGR.sys_id);
+        taskGR.addQuery('task_type', 'IOS Wipe');
+        taskGR.addQuery('active', 'true');
+        taskGR.query();
+        return taskGR.hasNext();
+    },
+
+    isAwaitingKeyItems: function(orderGR) {
+        var waiting = false;
+        if (orderGR && orderGR.isValidRecord()) {
+            var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+            subLineGR.addQuery('order_summary_key', orderGR.sys_id);
+            if (orderGR.order_type.toString().toLowerCase() == 'return') {
+                subLineGR.addEncodedQuery(this.keyItemStateFilterForSubLine);
+                subLineGR.addEncodedQuery(this.keyItemModelFilterForSubLine);
+            } else if (orderGR.order_type.toString().toLowerCase() == 'new') {
+                subLineGR.addQuery('state', 'Shipped'); // Awaiting installation
+                subLineGR.addEncodedQuery('model.sys_class_name=cmdb_hardware_product_model'); // All hardware
+            }
+            subLineGR.query();
+            waiting = subLineGR.hasNext();
+        }
+
+        return waiting;
+    },
+
+    getKeyItemStates: function(orderGR) {
+        var stateCounts = {
+            agree: false,
+            agreedState: '',
+            list: []
+        };
+
+        var subLineGA = new GlideAggregate('x_att2_abs_procure_abspl_order_sub_line_item');
+        subLineGA.addQuery('order_summary_key', orderGR.sys_id);
+        subLineGA.addEncodedQuery(this.keyItemModelFilterForSubLine);
+        subLineGA.groupBy('state');
+        subLineGA.addAggregate('COUNT');
+        subLineGA.query();
+        while (subLineGA.next()) {
+            stateCounts[subLineGA.state + ''] = subLineGA.getAggregate('COUNT');
+            stateCounts.list.push(subLineGA.state + '');
+        }
+
+        if (stateCounts.list.length == 1) {
+            stateCounts.agree = true;
+            stateCounts.agreedState = stateCounts.list[0];
+        }
+
+        return stateCounts;
+    },
+
+    keyItemModelFilterForSubLine: 'model.cmdb_model_categoryLIKEcceb7454c3031000b959fd251eba8f2d^ORmodel.cmdb_model_categoryLIKEbceb7454c3031000b959fd251eba8f42',
+    keyItemStateFilterForSubLine: 'stateNOT INComplete,Cancelled,Recovered,Recovered Damaged,Not Recovered',
+
+    getCountries: function(purchaseRequisition) {
+        var countrySysIds = [];
+        var purchaseReqGR = new GlideRecord('x_att2_abs_procure_purchase_requisition');
+        purchaseReqGR.addQuery('sys_id', purchaseRequisition + '');
+        purchaseReqGR.query();
+        if (purchaseReqGR.next()) {
+            var shipToCountry = purchaseReqGR.ship_to_country;
+
+            var receivingRulesGR = new GlideRecord('x_att2_abs_procure_receiving_rules');
+            receivingRulesGR.addQuery('country', shipToCountry + '');
+            receivingRulesGR.query();
+            if (receivingRulesGR.next()) {
+                var orgId = receivingRulesGR.organization_id;
+            }
+
+            var supplierGR = new GlideRecord('x_att2_abs_procure_supplier');
+            supplierGR.addQuery('country', shipToCountry + '');
+            supplierGR.addQuery('purchasing_unit', orgId);
+            supplierGR.addQuery('active', 'true');
+            supplierGR.query();
+            while (supplierGR.next()) {
+                countrySysIds.push(supplierGR.sys_id + '');
+            }
+        }
+        return countrySysIds;
+    },
+
+    checkAlternateModel: function(purchaseReq, checkType) {
+        var purchaseReqLine = new GlideRecord('x_att2_abs_procure_purchase_requisition_line_item');
+        purchaseReqLine.addQuery('purchase_requisition', purchaseReq + '');
+        purchaseReqLine.addNullQuery('alternate_model_number');
+        purchaseReqLine.query();
+        if (checkType == 'empty')
+            return purchaseReqLine.hasNext();
+        else if (checkType == 'notEmpty')
+            return !purchaseReqLine.hasNext();
+    },
+
+    setAllLineAndSublineItems: function(orderGR, lineState, sublineState) {
+        if (!(orderGR && orderGR.isValidRecord()))
+            return;
+
+        if (lineState) {
+            var lineItemGR = new GlideRecord('x_att2_abs_procure_abspl_order_line_item');
+            lineItemGR.addQuery('order', orderGR.sys_id + "");
+            lineItemGR.addQuery('state', '!=', 'Cancelled');
+            lineItemGR.query();
+            lineItemGR.setValue('state', lineState);
+            lineItemGR.updateMultiple();
+        }
+        if (sublineState) {
+            var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+            subLineGR.addQuery('order_summary_key', orderGR.sys_id + "");
+            subLineGR.addQuery('state', '!=', 'Cancelled');
+            subLineGR.query();
+            subLineGR.setValue('state', sublineState);
+            subLineGR.updateMultiple();
+        }
+    },
+
+    setAllOpenLineAndSublineItems: function(orderGR, lineState, sublineState) {
+
+        var lineItemGR = new GlideRecord('x_att2_abs_procure_abspl_order_line_item');
+        lineItemGR.addQuery('order', orderGR.sys_id + "");
+        lineItemGR.addQuery('state', '!=', 'Cancelled');
+        lineItemGR.addQuery('state', '!=', 'Complete');
+        lineItemGR.query();
+        while (lineItemGR.next()) {
+            lineItemGR.state = lineState + "";
+            lineItemGR.update();
+        }
+        if (sublineState) {
+            var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+            subLineGR.addQuery('order_summary_key', orderGR.sys_id + "");
+            subLineGR.addQuery('state', '!=', 'Cancelled');
+            subLineGR.addQuery('state', '!=', 'Complete');
+            subLineGR.query();
+            while (subLineGR.next()) {
+                subLineGR.state = sublineState + "";
+                subLineGR.update();
+            }
+        }
+    },
+
+    getServiceRequestFromComments: function(comments) {
+        var origSR = "";
+        if (comments.indexOf('SRNumber:') != -1) {
+            var newLineSplit = comments.split(',');
+            var srSplit = newLineSplit[0].split('SRNumber:');
+            if (srSplit[1])
+                origSR = srSplit[1].toString().trim();
+        }
+
+        return origSR;
+    },
+
+    type: 'ABSPLCommonUtil'
+};
