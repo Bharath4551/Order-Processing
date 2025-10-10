@@ -1,0 +1,494 @@
+var ABSPLAssetUtil = Class.create();
+
+ABSPLAssetUtil.prototype = {
+
+    initialize: function() {
+        this.HW_ASSET_STATUS_MAP = ABSPLAssetUtil.HW_ASSET_STATUS_MAP;
+    },
+
+    getHWAssetStatusMap: function() {
+        return this.HW_ASSET_STATUS_MAP;
+    },
+
+    getHWAssetGRFromSN: function(model_number, manufacturer, serial_number, allow_create) {
+        if (!model_number || !serial_number)
+            return false;
+
+        var assetGR = new GlideRecord('alm_hardware');
+        assetGR.addQuery('model.model_number', model_number);
+        assetGR.addQuery('serial_number', serial_number);
+        assetGR.query();
+        if (assetGR.getRowCount() > 1) {
+            throw new Error('Multiple assets found with the same model and serial number');
+        } else if (assetGR.next()) {
+            return assetGR;
+        } else if (allow_create + '' === 'true') {
+            if (assetGR.get(this.createNewHWAsset(model_number, manufacturer, serial_number)))
+                return assetGR;
+            else
+                throw new Error('Asset could not be created with model, manufacturer, and serial number provided: ' + model_number + ' | ' + manufacturer + ' | ' + serial_number);
+        }
+
+        return false;
+    },
+
+    createNewHWAsset: function(model_number, manufacturer, serial_number, asset_tag) {
+        if (!model_number || !manufacturer || !serial_number)
+            return false;
+
+        var model = this.getModelRecord(model_number, manufacturer);
+        if (model && model.isValidRecord() && model.sys_class_name.toString() == 'cmdb_hardware_product_model') {
+            var createAssetGR = new GlideRecord('alm_hardware');
+            createAssetGR.initialize();
+            createAssetGR.u_skipcreatecibr = true;
+            createAssetGR.serial_number = serial_number;
+            if (asset_tag)
+                createAssetGR.asset_tag = asset_tag;
+            this.setHWAssetStatusFromMap(createAssetGR, 'new', false);
+            createAssetGR.model = model.sys_id + "";
+            createAssetGR.model_category = model.cmdb_model_category + "";
+
+            return createAssetGR.insert();
+        } else {
+            return false;
+        }
+    },
+
+    moveConsumableAssets: function(manufacturer, model_number, stockroom_from, stockroom_to, quantity) {
+        var consumable = false;
+        var software = false;
+        var model_id = '';
+        var modelGR = new GlideRecord('cmdb_model');
+        modelGR.addQuery('model_number', model_number);
+        modelGR.addQuery('manufacturer.name', this.getManufacturer(manufacturer));
+        modelGR.query();
+        if (modelGR.next()) {
+            model_id = modelGR.sys_id + "";
+            if (modelGR.sys_class_name == "cmdb_consumable_product_model") {
+                consumable = true;
+            }
+            if (modelGR.sys_class_name == "cmdb_software_product_model") {
+                var softwareModelGR = new GlideRecord('cmdb_software_product_model');
+                softwareModelGR.addQuery('model_number', model_number);
+                softwareModelGR.addQuery('manufacturer.name', this.getManufacturer(manufacturer));
+                softwareModelGR.addQuery('edition', 'ABSPL');
+                softwareModelGR.query();
+                if (softwareModelGR.next()) {
+                    model_id = softwareModelGR.sys_id + "";
+                }
+                software = true;
+            }
+        }
+        if (consumable) {
+            var assetGR = new GlideRecord('alm_consumable');
+            assetGR.addQuery('model', model_id);
+            assetGR.addQuery('stockroom', stockroom_from);
+            assetGR.query();
+            if (assetGR.next()) {
+                assetGR.quantity = assetGR.quantity - parseInt(quantity, 10);
+                assetGR.update();
+            }
+
+            var assetGR = new GlideRecord('alm_consumable');
+            assetGR.addQuery('model', model_id);
+            assetGR.addQuery('stockroom', stockroom_to);
+            assetGR.query();
+            if (assetGR.next()) {
+                assetGR.quantity = assetGR.quantity + parseInt(quantity, 10);
+                assetGR.update();
+            } else {
+                createAssetGR = new GlideRecord('alm_consumable');
+                createAssetGR.initialize();
+                createAssetGR.u_skipcreatecibr = true;
+                createAssetGR.model = model_id;
+                createAssetGR.stockroom = stockroom_to;
+                createAssetGR.quantity = parseInt(quantity, 10);
+                createAssetGR.install_status = '6';
+                createAssetGR.substatus = 'available';
+                createAssetGR.insert();
+            }
+        }
+        if (software) {
+            var softwareGR = new GlideRecord('alm_license');
+            softwareGR.addQuery('software_model', model_id);
+            softwareGR.addQuery('stockroom', stockroom_from);
+            softwareGR.query();
+            if (softwareGR.next()) {
+                softwareGR.purchased_rights = softwareGR.purchased_rights - parseInt(quantity, 10);
+				softwareGR.quantity = softwareGR.quantity - parseInt(quantity, 10);
+                softwareGR.update();
+            } else {
+                var softwareGR = new GlideRecord('alm_license');
+                softwareGR.addQuery('software_model', model_id);
+                softwareGR.addQuery('stockroom', stockroom_to);
+                softwareGR.addQuery('software_model.edition', "ABSPL");
+                softwareGR.query();
+                if (softwareGR.next()) {
+                    softwareGR.purchased_rights = softwareGR.purchased_rights - parseInt(quantity, 10);
+					softwareGR.quantity = softwareGR.quantity - parseInt(quantity, 10);
+                    softwareGR.update();
+                } else {
+                    createAssetGR = new GlideRecord('alm_license');
+                    createAssetGR.initialize();
+                    createAssetGR.u_skipcreatecibr = true;
+                    createAssetGR.software_model = model_id;
+                    createAssetGR.stockroom = stockroom_to;
+                    createAssetGR.purchased_rights = parseInt(quantity, 10);
+                    createAssetGR.install_status = '6';
+                    createAssetGR.substatus = 'available';
+                    createAssetGR.insert();
+                }
+            }
+        }
+        return assetGR;
+    },
+
+    processConsumableAssetUpdate: function(manufacturer, model_number, stockroom, quantity) {
+        var stockGR = new GlideRecord('alm_stockroom');
+        if (stockGR.get('name', stockroom)) {
+            var stockroom_id = stockGR.sys_id + "";
+            var consumable = false;
+            var software = false;
+            var model_id = '';
+            var modelGR = new GlideRecord('cmdb_model');
+            modelGR.addQuery('model_number', model_number);
+            modelGR.addQuery('manufacturer.name', this.getManufacturer(manufacturer));
+            modelGR.query();
+            if (modelGR.next()) {
+                model_id = modelGR.sys_id + "";
+                if (modelGR.sys_class_name == "cmdb_consumable_product_model") {
+                    consumable = true;
+                }
+                if (modelGR.sys_class_name == "cmdb_software_product_model") {
+                    var softwareModelGR = new GlideRecord('cmdb_software_product_model');
+                    softwareModelGR.addQuery('model_number', model_number);
+                    softwareModelGR.addQuery('manufacturer.name', this.getManufacturer(manufacturer));
+                    softwareModelGR.addQuery('edition', 'ABSPL');
+                    softwareModelGR.query();
+                    if (softwareModelGR.next()) {
+                        model_id = softwareModelGR.sys_id + "";
+                    }
+                    software = true;
+                }
+            }
+            if (consumable) {
+                var assetGR = new GlideRecord('alm_consumable');
+                assetGR.addQuery('model', model_id);
+                assetGR.addQuery('stockroom', stockroom_id);
+                assetGR.query();
+                if (assetGR.next()) {
+                    assetGR.quantity = assetGR.quantity + parseInt(quantity, 10);
+                    assetGR.update();
+                } else {
+                    createAssetGR = new GlideRecord('alm_consumable');
+                    createAssetGR.initialize();
+                    createAssetGR.u_skipcreatecibr = true;
+                    createAssetGR.model = model_id;
+                    createAssetGR.stockroom = stockroom_id;
+                    createAssetGR.quantity = parseInt(quantity, 10);
+                    createAssetGR.install_status = 6;
+                    createAssetGR.substatus = 'available';
+                    createAssetGR.insert();
+                }
+            }
+            if (software) {
+                var softwareGR = new GlideRecord('alm_license');
+                softwareGR.addQuery('software_model', model_id);
+                softwareGR.addQuery('stockroom', stockroom_id);
+                softwareGR.addQuery('software_model.edition', "ABSPL");
+                softwareGR.query();
+                if (softwareGR.next()) {
+                    softwareGR.purchased_rights = softwareGR.purchased_rights + parseInt(quantity, 10);
+					softwareGR.quantity = softwareGR.quantity + parseInt(quantity, 10);
+                    softwareGR.update();
+                } else {
+                    createAssetGR = new GlideRecord('alm_license');
+                    createAssetGR.initialize();
+                    createAssetGR.u_skipcreatecibr = true;
+                    createAssetGR.software_model = model_id;
+                    createAssetGR.stockroom = stockroom_id;
+                    createAssetGR.install_status = 6; // In Stock
+                    createAssetGR.substatus = 'available';
+                    createAssetGR.purchased_rights = parseInt(quantity, 10);
+					createAssetGR.quantity = parseInt(quantity, 10);
+                    createAssetGR.insert();
+                }
+            }
+        }
+    },
+
+    setHWAssetStatus: function(assetGR, status, substatus) {
+        assetGR.install_status = status;
+        assetGR.substatus = substatus;
+        return assetGR.update();
+    },
+
+    setHWAssetStatusFromMap: function(assetGR, status, update) {
+        var condStatus = status.toString().toLowerCase().trim().replaceAll(' ', '_');
+        if (ABSPLAssetUtil.HW_ASSET_STATUS_MAP.hasOwnProperty(condStatus)) {
+            assetGR.install_status = ABSPLAssetUtil.HW_ASSET_STATUS_MAP[condStatus].status;
+            assetGR.substatus = ABSPLAssetUtil.HW_ASSET_STATUS_MAP[condStatus].substatus;
+
+            if (update !== false)
+                return assetGR.update();
+            else
+                return true;
+        }
+    },
+
+    decrementQuantity: function(assetGR) {
+        assetGR.quantity = parseFloat(assetGR.quantity) - 1;
+        if (assetGR.sys_class_name == 'alm_license') {
+            assetGR.purchased_rights = parseFloat(assetGR.purchased_rights) - 1;
+        }
+        return assetGR.update();
+    },
+
+    getManufacturer: function(manufacturer) {
+        var manufacturerName = manufacturer + '';
+
+        var cdsMapping = new GlideRecord('cds_client_mapping');
+        cdsMapping.addQuery('discovered_name', manufacturerName);
+        cdsMapping.query();
+
+        if (cdsMapping.next()) {
+            var company = new GlideRecord('core_company');
+            company.addQuery('hash', cdsMapping.canonical_name.hash + '');
+            company.addQuery('canonical', true);
+            company.query();
+
+            if (company.next()) {
+                manufacturerName = company.name + '';
+            }
+        }
+        return manufacturerName;
+    },
+
+    getModelRecord: function(model_number, manufacturer) {
+        var mfgr = this.getManufacturer(manufacturer);
+        var modelGR = new GlideRecord('cmdb_hardware_product_model');
+        modelGR.addQuery('manufacturer.name', mfgr);
+        modelGR.addQuery('model_number', model_number);
+        modelGR.query();
+        if (modelGR.next())
+            return modelGR;
+        else
+            return false;
+    },
+
+    getOrderHWAssets: function(orderSysId) {
+        var assets = [];
+
+        var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+        subLineGR.addQuery('order_summary_key', orderSysId);
+        subLineGR.addQuery('state', '!=', 'Cancelled');
+		subLineGR.addQuery('model.sys_class_name', 'cmdb_hardware_product_model');
+        subLineGR.addNotNullQuery('asset');
+        subLineGR.query();
+        while (subLineGR.next())
+            assets.push(subLineGR.asset.getRefRecord());
+
+        return assets;
+    },
+
+    type: 'ABSPLAssetUtil'
+};
+
+ABSPLAssetUtil.HW_ASSET_STATUS_MAP = {
+    "installed": {
+        "status": 1 /* In Use */ ,
+        "substatus": ""
+    },
+    "install": {
+        "status": 1 /* In Use */ ,
+        "substatus": ""
+    },
+    "reuse": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "available"
+    },
+    "reused": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "available"
+    },
+    "replace": {
+        "status": 1 /* In Use */ ,
+        "substatus": ""
+    },
+    "replaced": {
+        "status": 1 /* In Use */ ,
+        "substatus": ""
+    },
+    "refurbish": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_repair"
+    },
+    "refurbished": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_repair"
+    },
+    "defective": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "defective"
+    },
+    "defect": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "defective"
+    },
+    "trade": {
+        "status": 7 /* Retired */ ,
+        "substatus": "vendor_credit"
+    },
+    "traded": {
+        "status": 7 /* Retired */ ,
+        "substatus": "vendor_credit"
+    },
+    "sell": {
+        "status": 7 /* Retired */ ,
+        "substatus": "sold"
+    },
+    "sold": {
+        "status": 7 /* Retired */ ,
+        "substatus": "sold"
+    },
+    "dispose": {
+        "status": 7 /* Retired */ ,
+        "substatus": "disposed"
+    },
+    "disposed": {
+        "status": 7 /* Retired */ ,
+        "substatus": "disposed"
+    },
+    "scrap": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_disposal"
+    },
+    "scrapped": {
+        "status": 7 /* Retired */ ,
+        "substatus": "disposed"
+    },
+    "delete": {
+        "status": 7 /* Retired */ ,
+        "substatus": "disposed"
+    },
+    "deleted": {
+        "status": 7 /* Retired */ ,
+        "substatus": "disposed"
+    },
+    "missing": {
+        "status": 8 /* Missing */ ,
+        "substatus": "lost"
+    },
+    "donate": {
+        "status": 7 /* Retired */ ,
+        "substatus": "donated"
+    },
+    "donated": {
+        "status": 7 /* Retired */ ,
+        "substatus": "donated"
+    },
+    "shipped": {
+        "status": 9 /* In Transit */ ,
+        "substatus": "pending_install"
+    },
+    "ship": {
+        "status": 9 /* In Transit */ ,
+        "substatus": "pending_install"
+    },
+    "reserve": {
+        "status": 6 /* In Transit */ ,
+        "substatus": "reserved"
+    },
+    "reserved": {
+        "status": 6 /* In Transit */ ,
+        "substatus": "reserved"
+    },
+    "pick": {
+        "status": 6 /* In Transit */ ,
+        "substatus": "reserved"
+    },
+    "picked": {
+        "status": 6 /* In Transit */ ,
+        "substatus": "reserved"
+    },
+    "pending_return": {
+        "status": 9 /* In Transit */ ,
+        "substatus": "pending_disposal"
+    },
+    "pending_disposition": {
+        "status": 9 /* In Transit */ ,
+        "substatus": "pending_disposal"
+    },
+    "pending_disposal": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_disposal"
+    },
+    "waiting_disposition": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_disposal"
+    },
+    "to_be_recovered": {
+        "status": 9 /* In Transit */ ,
+        "substatus": "pending_disposal"
+    },
+    "destroy": {
+        "status": 7 /* Retired */ ,
+        "substatus": "disposed"
+    },
+    "destroyed": {
+        "status": 7 /* Retired */ ,
+        "substatus": "disposed"
+    },
+    "repair": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_repair"
+    },
+    "repaired": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "available"
+    },
+    "invt": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "available"
+    },
+    "damaged": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "defective"
+    },
+    "hold": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_disposal"
+    },
+	"resell": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_disposal"
+    },
+	"onsite": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_disposal"
+    },
+	"obf": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_disposal"
+    },
+	"na": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_disposal"
+    },
+	"test": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "pending_disposal"
+    },
+    "new": {
+        "status": 6 /* In Stock */ ,
+        "substatus": "available"
+    },
+	"migrated": {
+        "status": 1 /* In Use */ ,
+        "substatus": ""
+    },
+	"spare": {
+        "status": 3 /* In maintenance */ ,
+        "substatus": ""
+    }
+};
