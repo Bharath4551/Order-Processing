@@ -1,0 +1,46 @@
+{
+    "PartsInPO": {
+        "PONumber": "PO2671999",
+        "SR": "8809999",
+        "SendingSystem": "SNW",
+        "Timestamp": "2025-10-10 18:43:19",
+        "WarehouseID": "CTDI",
+        "PartList": [
+            {
+                "partListItems": {
+                    "Action": "New",
+                    "ManAltPartNum": "NFX250-ATT-LS1",
+                    "ManName": "Juniper Networks ",
+                    "ManPartNumber": "NFX250-ATT-LS1",
+                    "Quantity": "2",
+                    "SupplierName": "17902857:01.USD.42",
+                    "ConfigSequence": "1.0",
+                    "WarehouseLocation": "IS-CAPX-EU"
+                }
+            },
+            {
+                "partListItems": {
+                    "Action": "New",
+                    "ManAltPartNum": "ASB-5402-RM16-GLB",
+                    "ManName": "ACCELERATED CONCEPTS",
+                    "ManPartNumber": "ASB-5402-RM16-GLB",
+                    "Quantity": "2",
+                    "SupplierName": "17902857:01.USD.42",
+                    "ConfigSequence": "1.1",
+                    "WarehouseLocation": "IS-CAPX-EU"
+                }, 
+                {
+                "partListItems": {
+                    "Action": "New",
+                    "ManAltPartNum": "CAB-AC",
+                    "ManName": "Cisco Systems, Inc.",
+                    "ManPartNumber": "CAB-AC",
+                    "Quantity": "2",
+                    "SupplierName": "17902857:01.USD.42",
+                    "ConfigSequence": "1.2",
+                    "WarehouseLocation": "IS-CAPX-EU"
+                }
+            }
+        ]
+    }
+}
