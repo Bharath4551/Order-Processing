@@ -1,0 +1,929 @@
+var ABSPLExportCompliance = Class.create();
+
+ABSPLExportCompliance.STATE_TO_CHECK_MAP = {
+    'Check 1': 'Check 1',
+    'Check 2': 'Check 2',
+    'Staging': 'Check 2',
+    'International Hold': 'Check 2',
+    'Shipped': 'Check 3',
+    'Out of Stock': 'Check 1',
+    'Partial Stock': 'Check 1',
+    'Pending Documentation': 'Check 1'
+};
+
+ABSPLExportCompliance.prototype = {
+    initialize: function(order) {
+        this.ABSPLOrder = order;
+        var orderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+        if (typeof order == 'string') {
+            if (orderGR.get(order + ''))
+                this.ABSPLOrder = orderGR;
+            else
+                this.ABSPLOrder = null;
+        }
+
+        this.orgCode = '1246409';
+        this.orgType = 'OGT001';
+        this.weightUnit = 'LB';
+        this.recordOperation = 'CREATE';
+        this._errGrp = '3df59c34eb5156901c75fd77cad0cd5d' /* ABSPL Admin */ ;
+        this.LOG = [];
+    },
+
+    processExCompResult: function(result) {
+        result = (result + '').toLowerCase();
+        if (!result || result == 'undefined' || result == 'null')
+            return; // throw error?
+
+        var checkStr = ABSPLExportCompliance.STATE_TO_CHECK_MAP[this.ABSPLOrder.state + ''] || ABSPLExportCompliance.STATE_TO_CHECK_MAP[this.ABSPLOrder.substate + ''];
+        if (!checkStr)
+            return;
+
+        var logMsg = checkStr + ' result processing started...';
+
+        var state;
+        if (result == 'processed' || result == 'success') {
+            state = 'Compliance Processed';
+            logMsg = 'Export compliance ' + checkStr + ' processed';
+            if (checkStr == 'Check 1')
+                this.ABSPLOrder.check_1_processed = true;
+            else if (checkStr == 'Check 2')
+                this.ABSPLOrder.check_2_processed = true;
+
+			this.ABSPLOrder.setWorkflow(false);
+            this.ABSPLOrder.update();
+        } else if (result == 'hold') {
+            state = 'Compliance Hold';
+            logMsg = 'Order held for compliance during ' + checkStr;
+        } else {
+            state = 'Compliance Error';
+            logMsg = 'Order held for compliance during ' + checkStr;
+        }
+
+        new ABSPLCommonUtil().updateProcessingLog(this.ABSPLOrder, logMsg);
+
+        if (state == 'Compliance Processed')
+            new ABSPLOrderStateFlow(this.ABSPLOrder).updateOrderState();
+        else
+            new ABSPLOrderStateFlow(this.ABSPLOrder).updateOrderState(checkStr, state);
+    },
+
+    processExportOrderAsync: function() {
+        /****** COMPLIANCE: CHECK 1 *******/
+        if (!(this.ABSPLOrder && this.ABSPLOrder.isValidRecord())) {
+            this._logError(null, 'Internal error: Could not process export order--Order object is null', false);
+            return false;
+        }
+
+        var orderItemGR = this._getOrderItemsFromOrder(this.ABSPLOrder);
+        if (orderItemGR && orderItemGR.hasNext()) {
+
+            var processedDateTime = new GlideDateTime(this.ABSPLOrder.processed_date);
+            var processedDate = processedDateTime.getDate().getByFormat('yyyy-MM-dd');
+            var processedTime = processedDateTime.getTime().getByFormat('HH:mm:ss');
+
+            try {
+                var s = new sn_ws.SOAPMessageV2('x_att2_abs_procure.ExportCompliances', 'ClientInboundAsyncSoap12.processExportOrderAsync');
+
+                s.setStringParameter('exportOrder.recordStamp', processedDate + 'T' + processedTime);
+                s.setStringParameter('EsOrganizationApi.OrgCode', this.orgCode);
+                s.setStringParameter('EsOrganizationApi.OrgTypeCode', this.orgType);
+                s.setStringParameter('exportOrder.OrderNumber', this.ABSPLOrder.eol_number + '');
+                s.setStringParameter('exportOrder.OrderDate', processedDate + 'T' + processedTime);
+                s.setStringParameter('exportOrder.invoiceNumber', this.ABSPLOrder.service_request_number.service_request + '');
+                s.setStringParameter('exportOrder.localOrigin', this.ABSPLOrder.ship_to_country.iso3166_2 + '');
+                s.setStringParameter('exportOrder.localDestination', this.ABSPLOrder.mark_for_country.iso3166_2 + '');
+
+                /*** SHIP FROM ***/
+                s.setStringParameter('ship_from.partnerID', this.ABSPLOrder.ship_to_clli_code + '');
+                //s.setStringParameter('ship_from.federalID1', '54321'); // No longer required
+                //s.setStringParameter('ship_from.federalID2', '54321'); // No longer required
+                s.setStringParameter('ship_from.companyName', this.ABSPLOrder.ship_to_company_name + '');
+                s.setStringParameter('ship_from.contactName', this.ABSPLOrder.ship_to_contact_name + '');
+                s.setStringParameter('ship_from.phone', this.ABSPLOrder.ship_to_contact_phone_number + '');
+                s.setStringParameter('ship_from.email', this.ABSPLOrder.ship_to_contact_e_mail + '');
+                s.setStringParameter('ship_from.address', this._formatAddress([this.ABSPLOrder.ship_to_street_address_line_1 + '', this.ABSPLOrder.ship_to_street_address_line_2 + '']));
+                s.setStringParameter('ship_from.city', this.ABSPLOrder.ship_to_city + '');
+                s.setStringParameter('ship_from.state', this.ABSPLOrder.ship_to_state_or_province + '');
+                s.setStringParameter('ship_from.zipCode', this.ABSPLOrder.ship_to_zip_code_or_postal_code + '');
+                s.setStringParameter('ship_from.countryCode', this.ABSPLOrder.ship_to_country.iso3166_2 + '');
+
+                /*** SHIP TO ***/
+                s.setStringParameter('ship_to.partnerID', this.ABSPLOrder.mark_for_clli_code + '');
+                //s.setStringParameter('ship_to.federalID1', '12345'); // No longer required
+                //s.setStringParameter('ship_to.federalID2', '12345'); // No longer required
+                s.setStringParameter('ship_to.companyName', this.ABSPLOrder.mark_for_company_name + '');
+                s.setStringParameter('ship_to.contactName', this.ABSPLOrder.mark_for_contact_name + '');
+                s.setStringParameter('ship_to.phone', this.ABSPLOrder.mark_for_contact_phone_number + '');
+                s.setStringParameter('ship_to.email', this.ABSPLOrder.mark_for_contact_e_mail + '');
+                s.setStringParameter('ship_to.address', this._formatAddress([this.ABSPLOrder.mark_for_street_address_line_1 + '', this.ABSPLOrder.mark_for_street_address_line_2 + '']));
+                s.setStringParameter('ship_to.city', this.ABSPLOrder.mark_for_city + '');
+                s.setStringParameter('ship_to.state', this.ABSPLOrder.mark_for_state_or_province + '');
+                s.setStringParameter('ship_to.zipCode', this.ABSPLOrder.mark_for_zip_code_or_postal_code + '');
+                s.setStringParameter('ship_to.countryCode', this.ABSPLOrder.mark_for_country.iso3166_2 + '');
+
+                /*** ULTIMATE CONSIGNEE ***/
+                s.setStringParameter('ultimate_consignee.partnerID', this.ABSPLOrder.mark_for_clli_code + '');
+                //s.setStringParameter('ultimate_consignee.federalID1', '12345'); // No longer required
+                //s.setStringParameter('ultimate_consignee.federalID2', '12345'); // No longer required
+                s.setStringParameter('ultimate_consignee.companyName', this.ABSPLOrder.mark_for_company_name + '');
+                s.setStringParameter('ultimate_consignee.contactName', this.ABSPLOrder.mark_for_contact_name + '');
+                s.setStringParameter('ultimate_consignee.phone', this.ABSPLOrder.mark_for_contact_phone_number + '');
+                s.setStringParameter('ultimate_consignee.email', this.ABSPLOrder.mark_for_contact_e_mail + '');
+                s.setStringParameter('ultimate_consignee.address', this._formatAddress([this.ABSPLOrder.mark_for_street_address_line_1 + '', this.ABSPLOrder.mark_for_street_address_line_2 + '']));
+                s.setStringParameter('ultimate_consignee.city', this.ABSPLOrder.mark_for_city + '');
+                s.setStringParameter('ultimate_consignee.state', this.ABSPLOrder.mark_for_state_or_province + '');
+                s.setStringParameter('ultimate_consignee.zipCode', this.ABSPLOrder.mark_for_zip_code_or_postal_code + '');
+                s.setStringParameter('ultimate_consignee.countryCode', this.ABSPLOrder.mark_for_country.iso3166_2 + '');
+
+                var exportTxnRuleGR = this.getExportTxnRule();
+                if (exportTxnRuleGR && exportTxnRuleGR.isValidRecord()) {
+                    this.LOG.push('Using Export Transaction Rule "' + exportTxnRuleGR.name + '"');
+
+                    /*** BILL_TO (IMPORTER OF RECORD) ***/
+                    s.setStringParameter('bill_to.partnerID', exportTxnRuleGR.importer.partner_id + '');
+                    s.setStringParameter('bill_to.federalID1', exportTxnRuleGR.importer.legal_entity_id);
+                    s.setStringParameter('bill_to.federalID2', exportTxnRuleGR.importer.legal_entity_id_2);
+                    s.setStringParameter('bill_to.companyName', exportTxnRuleGR.importer.name + '');
+                    s.setStringParameter('bill_to.contactName', exportTxnRuleGR.importer.contact_name + '');
+                    s.setStringParameter('bill_to.phone', exportTxnRuleGR.importer.contact_phone + '');
+                    s.setStringParameter('bill_to.email', exportTxnRuleGR.exporter.contact_email + '');
+                    s.setStringParameter('bill_to.address', this._formatAddress([exportTxnRuleGR.importer.address + '']));
+                    s.setStringParameter('bill_to.city', exportTxnRuleGR.importer.city + '');
+                    s.setStringParameter('bill_to.state', exportTxnRuleGR.importer.state_or_province + '');
+                    s.setStringParameter('bill_to.zipCode', exportTxnRuleGR.importer.postal_code + '');
+                    s.setStringParameter('bill_to.countryCode', exportTxnRuleGR.importer.country.iso3166_2 + '');
+
+                    /*** SELLER (EXPORTER OF RECORD) ***/
+                    s.setStringParameter('seller.partnerID', exportTxnRuleGR.exporter.partner_id + '');
+                    s.setStringParameter('seller.federalID1', exportTxnRuleGR.exporter.legal_entity_id);
+                    s.setStringParameter('seller.federalID2', exportTxnRuleGR.exporter.legal_entity_id_2);
+                    s.setStringParameter('seller.companyName', exportTxnRuleGR.exporter.name + '');
+                    s.setStringParameter('seller.contactName', exportTxnRuleGR.exporter.contact_name + '');
+                    s.setStringParameter('seller.phone', exportTxnRuleGR.exporter.contact_phone + '');
+                    s.setStringParameter('seller.email', exportTxnRuleGR.exporter.contact_email + '');
+                    s.setStringParameter('seller.address', this._formatAddress([exportTxnRuleGR.exporter.address + '']));
+                    s.setStringParameter('seller.city', exportTxnRuleGR.exporter.city + '');
+                    s.setStringParameter('seller.state', exportTxnRuleGR.exporter.state_or_province + '');
+                    s.setStringParameter('seller.zipCode', exportTxnRuleGR.exporter.postal_code + '');
+                    s.setStringParameter('seller.countryCode', exportTxnRuleGR.exporter.country.iso3166_2 + '');
+
+                    s.setStringParameter('exportOrderExporter.PartnerCode', exportTxnRuleGR.exporter.partner_id + '');
+                } else {
+                    // ERROR: Unable to locate export txn rule -- log error and create task for manual intervention
+                    this._logError(this.ABSPLOrder, 'Cannot locate matching export transaction rule. Order sent to OneSource with missing "Importer" and "Exporter" information.', true);
+                }
+
+                var itemXMLString = '';
+                while (orderItemGR.next()) {
+                    itemXMLString += this._getOrderItemXMLString(orderItemGR);
+                }
+                s.setStringParameterNoEscape('v_ExportOrderItems', itemXMLString);
+
+                return this._executeRequest(this.ABSPLOrder, s, 'processExportOrderAsync');
+
+            } catch (ex) {
+                this._logError(this.ABSPLOrder, 'Internal error: ' + ex.message + '\n' + ex.sourceName + ':' + ex.lineNumber, false);
+                return false;
+            }
+        } else {
+            this._logError(this.ABSPLOrder, 'Cannot send compliance check for ' + this.ABSPLOrder.eol_number + '. No order items found.', false);
+            return false;
+        }
+    },
+
+    processExportInvoiceAsync: function() {
+        /****** COMPLIANCE: CHECK 2 *******/
+        if (!(this.ABSPLOrder && this.ABSPLOrder.isValidRecord())) {
+            this._logError(null, 'Internal error: Could not process export invoice--Order object is null', false);
+            return false;
+        }
+
+        var orderItemGR = this._getOrderSubItemsFromOrder(this.ABSPLOrder);
+        if (orderItemGR && orderItemGR.hasNext()) {
+            var processedDateTime = new GlideDateTime(this.ABSPLOrder.processed_date);
+            var processedDate = processedDateTime.getDate().getByFormat('yyyy-MM-dd');
+            var processedTime = processedDateTime.getTime().getByFormat('HH:mm:ss');
+
+            try {
+                var s = new sn_ws.SOAPMessageV2('x_att2_abs_procure.ExportCompliances', 'ClientInboundAsyncSoap12.processExportInvoiceAsync');
+
+                s.setStringParameter('exportInvoice.recordOperation', this.recordOperation);
+                s.setStringParameter('exportInvoice.recordStamp', processedDate + 'T' + processedTime);
+                s.setStringParameter('exportInvoice.invoiceNum', this.ABSPLOrder.service_request_number.service_request + '');
+                s.setStringParameter('exportInvoice.interfaceRef', this.ABSPLOrder.eol_number + '');
+                s.setStringParameter('exportInvoice.invoiceDate', processedDate + 'T' + processedTime);
+                s.setStringParameter('exportInvoice.orderDate', processedDate + 'T' + processedTime);
+                s.setStringParameter('exportInvoice.orderNum', this.getInvoicePONumbers().join('|'));
+                s.setStringParameter('exportInvoice.invoiceOrigin', this.ABSPLOrder.ship_to_country.iso3166_2 + '');
+                s.setStringParameter('exportInvoice.invoiceDestination', this.ABSPLOrder.mark_for_country.iso3166_2 + '');
+                s.setStringParameter('exportInvoice.weightUOM', this.weightUnit);
+                s.setStringParameter('exportInvoice.modeTransportation', this.ABSPLOrder.mode_of_transport);
+                s.setStringParameter('exportInvoice.weight', this.ABSPLOrder.gross_weight_lb);
+                s.setStringParameter('exportInvoice.totalNbrPieces', this._getSubItemCount());
+                s.setStringParameter('exportInvoice.trackingNumber', this._escapeForXMLText(this.ABSPLOrder.tracking_number + ''));
+                s.setStringParameter('ship_to.partnerID', this.ABSPLOrder.mark_for_clli_code + '');
+                //s.setStringParameter('ship_to.federalID1', '12345'); // No longer required
+                //s.setStringParameter('ship_to.federalID2', '12345'); // No longer required
+                s.setStringParameter('ship_to.companyName', this.ABSPLOrder.mark_for_company_name + '');
+                s.setStringParameter('ship_to.contactName', this.ABSPLOrder.mark_for_contact_name + '');
+                s.setStringParameter('ship_to.address', this._formatAddress([this.ABSPLOrder.mark_for_street_address_line_1 + '', this.ABSPLOrder.mark_for_street_address_line_2 + '']));
+                s.setStringParameter('ship_to.city', this.ABSPLOrder.mark_for_city + '');
+                s.setStringParameter('ship_to.state', this.ABSPLOrder.mark_for_state_or_province + '');
+                s.setStringParameter('ship_to.zipCode', this.ABSPLOrder.mark_for_zip_code_or_postal_code + '');
+                s.setStringParameter('ship_to.countryCode', this.ABSPLOrder.mark_for_country.iso3166_2 + '');
+                s.setStringParameter('ship_from.partnerID', this.ABSPLOrder.ship_to_clli_code + '');
+                //s.setStringParameter('ship_from.federalID1', '54321'); // No longer required
+                //s.setStringParameter('ship_from.federalID2', '54321'); // No longer required
+                s.setStringParameter('ship_from.companyName', this.ABSPLOrder.ship_to_company_name + '');
+                s.setStringParameter('ship_from.contactName', this.ABSPLOrder.ship_to_contact_name + '');
+                s.setStringParameter('ship_from.address', this._formatAddress([this.ABSPLOrder.ship_to_street_address_line_1 + '', this.ABSPLOrder.ship_to_street_address_line_2 + '']));
+                s.setStringParameter('ship_from.city', this.ABSPLOrder.ship_to_city + '');
+                s.setStringParameter('ship_from.state', this.ABSPLOrder.ship_to_state_or_province + '');
+                s.setStringParameter('ship_from.zipCode', this.ABSPLOrder.ship_to_zip_code_or_postal_code + '');
+                s.setStringParameter('ship_from.countryCode', this.ABSPLOrder.ship_to_country.iso3166_2 + '');
+                s.setStringParameter('ultimate_consignee.partnerID', this.ABSPLOrder.mark_for_clli_code + '');
+                //s.setStringParameter('ultimate_consignee.federalID1', '12345'); // No longer required
+                //s.setStringParameter('ultimate_consignee.federalID2', '12345'); // No longer required
+                s.setStringParameter('ultimate_consignee.companyName', this.ABSPLOrder.mark_for_company_name + '');
+                s.setStringParameter('ultimate_consignee.contactName', this.ABSPLOrder.mark_for_contact_name + '');
+                s.setStringParameter('ultimate_consignee.address', this._formatAddress([this.ABSPLOrder.mark_for_street_address_line_1 + '', this.ABSPLOrder.mark_for_street_address_line_2 + '']));
+                s.setStringParameter('ultimate_consignee.city', this.ABSPLOrder.mark_for_city + '');
+                s.setStringParameter('ultimate_consignee.state', this.ABSPLOrder.mark_for_state_or_province + '');
+                s.setStringParameter('ultimate_consignee.zipCode', this.ABSPLOrder.mark_for_zip_code_or_postal_code + '');
+                s.setStringParameter('ultimate_consignee.countryCode', this.ABSPLOrder.mark_for_country.iso3166_2 + '');
+                /* ${exportInvoice.totalCharges}|${exportInvoice.netWeightLB}|${exportInvoice.netWeightKG}|${exportInvoice.grossWeightLB}|${exportInvoice.grossWeightKG} */
+                //s.setStringParameter('exportInvoice.netWeightLB', '999'); // No longer required
+                //s.setStringParameter('exportInvoice.netWeightKG', '999'); // No longer required
+                s.setStringParameter('exportInvoice.grossWeightLB', this.ABSPLOrder.gross_weight_lb);
+                s.setStringParameter('exportInvoice.grossWeightKG', this.ABSPLOrder.gross_weight_kg);
+
+                /*<n0:flexField4>${exportInvoice.totalPallets}|${exportInvoice.totalCommercialValue}|${exportInvoice.totalCustomsValue}|${exportInvoice.totalPackages}</n0:flexField4>*/
+                s.setStringParameter('exportInvoice.totalPallets', this.ABSPLOrder.total_pallets);
+                s.setStringParameter('exportInvoice.totalPackages', this.ABSPLOrder.total_packages);
+
+                var itemXMLString = '';
+                var totalPrice = 0.0;
+                var hazmat = false;
+                while (orderItemGR.next()) {
+                    itemXMLString += this._getInvoiceItemXMLString(orderItemGR);
+                    totalPrice += parseFloat(orderItemGR.order_line_key.at_t_price + '');
+                    if (orderItemGR.hazmat + '' == 'true')
+                        hazmat = true;
+                }
+                s.setStringParameter('exportInvoice.hazmatFlag', hazmat ? 'Y' : 'N');
+                s.setStringParameter('exportInvoice.totalCommercialValue', totalPrice);
+                s.setStringParameter('exportInvoice.totalCustomsValue', totalPrice);
+                s.setStringParameter('exportInvoice.totalCharges', totalPrice + parseFloat(this.ABSPLOrder.staging_cost + ''));
+
+                s.setStringParameterNoEscape('v_exportInvoiceItems', itemXMLString);
+
+                var exportTxnRuleGR = this.getExportTxnRule();
+                if (exportTxnRuleGR && exportTxnRuleGR.isValidRecord()) {
+                    this.LOG.push('Using Export Transaction Rule "' + exportTxnRuleGR.name + '"');
+
+                    s.setStringParameter('exportInvoice.invoicePayer', exportTxnRuleGR.exporter.legal_entity_id + '');
+                    s.setStringParameter('exportInvoice.paymentTerms', exportTxnRuleGR.shipping_charges + '');
+                    s.setStringParameter('exportInvoice.incoterm', exportTxnRuleGR.inco_term + '');
+                    s.setStringParameter('exportInvoice.incotermLocal', this._getIncoTermLocale(exportTxnRuleGR.inco_term + ''));
+
+                    /*** CARRIER ***/
+                    s.setStringParameter('carrier.partnerID', exportTxnRuleGR.carrier.partner_id + '');
+                    s.setStringParameter('carrier.federalID1', exportTxnRuleGR.carrier.legal_entity_id);
+                    s.setStringParameter('carrier.federalID2', exportTxnRuleGR.carrier.legal_entity_id_2);
+                    s.setStringParameter('carrier.companyName', exportTxnRuleGR.carrier.name + '');
+                    s.setStringParameter('carrier.contactName', exportTxnRuleGR.carrier.contact_name + '');
+                    s.setStringParameter('carrier.address', this._formatAddress([exportTxnRuleGR.carrier.address + '']));
+                    s.setStringParameter('carrier.city', exportTxnRuleGR.carrier.city + '');
+                    s.setStringParameter('carrier.state', exportTxnRuleGR.carrier.state_or_province + '');
+                    s.setStringParameter('carrier.zipCode', exportTxnRuleGR.carrier.postal_code + '');
+                    s.setStringParameter('carrier.countryCode', exportTxnRuleGR.carrier.country.iso3166_2 + '');
+
+                    /*** BILL_TO (IMPORTER OF RECORD) ***/
+                    s.setStringParameter('bill_to.partnerID', exportTxnRuleGR.importer.partner_id + '');
+                    s.setStringParameter('bill_to.federalID1', exportTxnRuleGR.importer.legal_entity_id);
+                    s.setStringParameter('bill_to.federalID2', exportTxnRuleGR.importer.legal_entity_id_2);
+                    s.setStringParameter('bill_to.companyName', exportTxnRuleGR.importer.name + '');
+                    s.setStringParameter('bill_to.contactName', exportTxnRuleGR.importer.contact_name + '');
+                    s.setStringParameter('bill_to.address', this._formatAddress([exportTxnRuleGR.importer.address + '']));
+                    s.setStringParameter('bill_to.city', exportTxnRuleGR.importer.city + '');
+                    s.setStringParameter('bill_to.state', exportTxnRuleGR.importer.state_or_province + '');
+                    s.setStringParameter('bill_to.zipCode', exportTxnRuleGR.importer.postal_code + '');
+                    s.setStringParameter('bill_to.countryCode', exportTxnRuleGR.importer.country.iso3166_2 + '');
+
+                    /*** SELLER (EXPORTER OF RECORD) ***/
+                    s.setStringParameter('seller.partnerID', exportTxnRuleGR.exporter.partner_id + '');
+                    s.setStringParameter('seller.federalID1', exportTxnRuleGR.exporter.legal_entity_id);
+                    s.setStringParameter('seller.federalID2', exportTxnRuleGR.exporter.legal_entity_id_2);
+                    s.setStringParameter('seller.companyName', exportTxnRuleGR.exporter.name + '');
+                    s.setStringParameter('seller.contactName', exportTxnRuleGR.exporter.contact_name + '');
+                    s.setStringParameter('seller.address', this._formatAddress([exportTxnRuleGR.exporter.address + '']));
+                    s.setStringParameter('seller.city', exportTxnRuleGR.exporter.city + '');
+                    s.setStringParameter('seller.state', exportTxnRuleGR.exporter.state_or_province + '');
+                    s.setStringParameter('seller.zipCode', exportTxnRuleGR.exporter.postal_code + '');
+                    s.setStringParameter('seller.countryCode', exportTxnRuleGR.exporter.country.iso3166_2 + '');
+                    s.setStringParameter('exporter.contactPhone', exportTxnRuleGR.exporter.contact_phone + '');
+                    s.setStringParameter('exporter.federalID1', exportTxnRuleGR.exporter.legal_entity_id);
+                    s.setStringParameter('exporter.federalID2', exportTxnRuleGR.exporter.legal_entity_id_2);
+                    s.setStringParameter('exporter.companyName', exportTxnRuleGR.exporter.name + '');
+                    s.setStringParameter('exporter.contactEmail', exportTxnRuleGR.exporter.contact_email + '');
+                    s.setStringParameter('exporter.address', this._formatAddress([exportTxnRuleGR.exporter.address + '']));
+                    s.setStringParameter('exporter.city', exportTxnRuleGR.exporter.city + '');
+                    s.setStringParameter('exporter.state', exportTxnRuleGR.exporter.state_or_province + '');
+                    s.setStringParameter('exporter.zipCode', exportTxnRuleGR.exporter.postal_code + '');
+                    s.setStringParameter('exporter.countryCode', exportTxnRuleGR.exporter.country.iso3166_2 + '');
+                } else {
+                    // ERROR: Unable to locate export txn rule -- log error and create task for manual intervention
+                    this._logError(this.ABSPLOrder, 'Cannot locate export transaction rule. Order sent to OneSource with missing "Carrier", "Importer", and "Exporter" information.', true);
+                }
+
+                return this._executeRequest(this.ABSPLOrder, s, 'processExportInvoiceAsync');
+
+            } catch (ex) {
+                this._logError(this.ABSPLOrder, 'Internal error: ' + ex.message + '\n' + ex.sourceName + ':' + ex.lineNumber, false);
+                return false;
+            }
+        } else {
+            this._logError(this.ABSPLOrder, 'Cannot submit compliance check for ' + this.ABSPLOrder.eol_number + '. No order items found.', false);
+            return false;
+        }
+    },
+
+    processShippingNotice: function() {
+        /****** COMPLIANCE: ORDER SHIPPED NOTICE (CHECK 3) *******/
+        if (!(this.ABSPLOrder && this.ABSPLOrder.isValidRecord())) {
+            this._logError(null, 'Internal error: Could not process export order shipping notice--Order object is null', false);
+            return false;
+        }
+
+        this.recordOperation = 'UPDATE';
+        this.processExportInvoiceAsync();
+    },
+
+    isExportComplianceRequired: function(check) {
+        if (!(this.ABSPLOrder && this.ABSPLOrder.isValidRecord())) {
+            this._logError(null, 'Internal error: Could not process export compliance rule--Order object is null', false);
+            return true;
+        }
+
+        var checkNum = check || ABSPLExportCompliance.STATE_TO_CHECK_MAP[this.ABSPLOrder.state + ''] || ABSPLExportCompliance.STATE_TO_CHECK_MAP[this.ABSPLOrder.substate + ''] || 'Check 1';
+
+        var ship_iso2 = this.ABSPLOrder.ship_to_country.iso3166_2 + '',
+            mark_iso2 = this.ABSPLOrder.mark_for_country.iso3166_2 + '',
+            warehouse_iso2 = this.ABSPLOrder.warehouse.warehouse_country_location.iso3166_2 + '';
+
+        var staged = this.ABSPLOrder.staged.toString() == 'true';
+
+        if (staged) {
+            // Check not required within the same country
+            if (mark_iso2 == ship_iso2)
+                return false;
+        } else {
+            // Check not required for direct-ship
+            if (new ABSPLCommonUtil().allOutOfStock(this.ABSPLOrder))
+                return false;
+
+            // Check not required within the same country
+            if (mark_iso2 == ship_iso2 && (this.ABSPLOrder.warehouse.nil() || mark_iso2 == warehouse_iso2))
+                return false;
+        }
+
+        // Check 1 always required for transaction between different countries
+        if (checkNum == 'Check 1')
+            return true;
+
+        // Check 2/3 not required within EU
+        //var eu_exclude_list = gs.getProperty('x_att2_abs_procure.eu_countries_no_compliance');
+        var eu_exclude_list = 'AT,BE,BG,HR,CZ,DK,EE,FI,FR,DE,GR,HU,IE,IT,LV,LT,LU,MT,NL,PL,PT,RO,SK,SI,ES,SE';
+        if (
+            (eu_exclude_list.indexOf(mark_iso2) >= 0) &&
+            (eu_exclude_list.indexOf(ship_iso2) >= 0)
+        ) {
+            return false;
+        }
+
+        return true;
+    },
+
+    setRecordOperation: function(op) {
+        this.recordOperation = op;
+    },
+
+    getExportTxnRule: function() {
+        if (!(this.ABSPLOrder && this.ABSPLOrder.isValidRecord())) {
+            this._logError(null, 'Internal error: Could not locate export transaction rule--Order record is not valid', false);
+            return null;
+        }
+
+        var found = false;
+
+        var ruleGR = new GlideRecord('x_att2_abs_procure_export_transaction_rule');
+        ruleGR.addQuery('country_from', this.ABSPLOrder.ship_to_country);
+        ruleGR.addQuery('country_to', this.ABSPLOrder.mark_for_country);
+        var serviceQuery = ruleGR.addQuery('service_line', this.ABSPLOrder.service_line);
+        ruleGR.orderByDesc('value_dependent');
+        ruleGR.query();
+        if (!ruleGR.hasNext()) {
+            serviceQuery.addOrCondition('service_line', '');
+            ruleGR.query();
+        }
+        while (ruleGR.next()) {
+            if (ruleGR.value_dependent + '' == 'false') {
+                found = true;
+                break;
+            } else {
+                var totalCost = this.getTotalOrderCost();
+                if (ruleGR.value_condition.toString().toLowerCase() == 'greater than' && totalCost > parseFloat(ruleGR.value + '')) {
+                    found = true;
+                    break;
+                } else if (ruleGR.value_condition.toString().toLowerCase() == 'less than' && totalCost < parseFloat(ruleGR.value + '')) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        return found ? ruleGR : false;
+    },
+
+    _getIncoTermLocale: function(incoTerm) {
+        if (incoTerm == 'FCA')
+            return this.ABSPLOrder.ship_to_city + '';
+        else if (incoTerm == 'DAP' || incoTerm == 'DDP')
+            return this.ABSPLOrder.ship_to_city + this.ABSPLOrder.ship_to_zip_code_or_postal_code + this.ABSPLOrder.ship_to_country.iso3166_2;
+        else
+            return 'UNKNOWN';
+    },
+
+    getTotalOrderCost: function() {
+        var totalCost = 0.0;
+        var orderItemsGR = this._getOrderItemsFromOrder(this.ABSPLOrder);
+        while (orderItemsGR.next())
+            totalCost += parseFloat(orderItemsGR.at_t_total_price + '');
+
+        return totalCost;
+    },
+
+    getInvoicePONumbers: function() {
+        var poNums = [];
+        var prItemGR = new GlideRecord('x_att2_abs_procure_purchase_requisition_line_item');
+        prItemGR.addQuery('purchase_requisition.order_summary_key', this.ABSPLOrder.sys_id);
+        prItemGR.addQuery('eol_line_number', 'IN', '1002,1003');
+        prItemGR.query();
+        while (prItemGR.next())
+            poNums.push(prItemGR.purchase_order.po_number + '');
+
+        return poNums;
+    },
+
+    createFinRepForFinTask: function(finTaskGR) {
+        var Headers = ["SENT TO CONTROLLER", "Shipped from", "Country", "RCC", "ICPO#", "Ship Date", "Value ($)", "SR#/Order #", "Service Line"];
+        var fileName = 'SEEDSTOCK_order_' + this.ABSPLOrder.service_request_number.service_request + '.csv';
+        var csvData = '';
+        for (var i = 0; i < Headers.length; i++) {
+            csvData = csvData + '"' + Headers[i] + '"' + ',';
+        }
+        csvData = csvData + "\r\n";
+        csvData = csvData + '"' + new GlideDate() + '",' + '"' + this.ABSPLOrder.ship_to_country.iso3166_2 + '",' + '"' + this.ABSPLOrder.mark_for_country.name + '",' + '"",' + '"' + this._getICPONum() + '",' + '"' + this.ABSPLOrder.ship_date + '",' + '"' + this.getTotalOrderCost() + '",' + '"' + this.ABSPLOrder.service_request_number.service_request + '",' + '"' + this.ABSPLOrder.service_line.name + '"';
+        csvData = csvData + "\r\n";
+
+        new GlideSysAttachment().write(finTaskGR, fileName, 'application/csv', csvData);
+    },
+
+    _getICPONum: function() {
+        var poGR = new GlideRecord('x_att2_abs_procure_abspl_purchase_order');
+        poGR.addQuery('purchase_requisition.type', 'ICPO');
+        poGR.addQuery('purchase_requisition.order_summary_key', this.ABSPLOrder.sys_id);
+        poGR.query();
+        if (poGR.next())
+            return poGR.po_number + '';
+        else
+            return '';
+    },
+
+    _getOriginCountry: function() {
+        if (this.ABSPLOrder.staged == false) {
+            var reservationGR = new GlideRecord('x_att2_abs_procure_reservation_rule');
+            reservationGR.addEncodedQuery('effective_dateRELATIVELT@minute@ago@0^warehouse.countryLIKE' + this.ABSPLOrder.mark_for_country + '^service_line=' + this.ABSPLOrder.service_line);
+            reservationGR.query();
+            if (reservationGR.next()) {
+                return reservationGR.warehouse.warehouse_country_location.iso3166_2 + "";
+            }
+        } else {
+            return this.ABSPLOrder.ship_to_country.iso3166_2 + '';
+        }
+    },
+
+    _getOrderItemsFromOrder: function() {
+        if (!(this.ABSPLOrder && this.ABSPLOrder.isValidRecord())) {
+            this._logError(null, 'Internal error: Could not locate order items--Order record is not valid', false);
+            return false;
+        }
+
+        var itemGR = new GlideRecord('x_att2_abs_procure_abspl_order_line_item');
+        itemGR.addQuery('order', this.ABSPLOrder.sys_id);
+        itemGR.addQuery('state', '!=', 'Cancelled');
+        itemGR.query();
+
+        return itemGR;
+    },
+
+    _getOrderSubItemsFromOrder: function() {
+        if (!(this.ABSPLOrder && this.ABSPLOrder.isValidRecord())) {
+            this._logError(null, 'Internal error: Could not locate order sub items--Order record is not valid', false);
+            return false;
+        }
+
+        var itemGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+        itemGR.addQuery('order_summary_key', this.ABSPLOrder.sys_id);
+        itemGR.addQuery('state', '!=', 'Cancelled');
+        itemGR.query();
+
+        return itemGR;
+    },
+
+    _getSubItemCount: function() {
+        if (!(this.ABSPLOrder && this.ABSPLOrder.isValidRecord())) {
+            this._logError(null, 'Internal error: Could not locate order sub items--Order record is not valid', false);
+            return 0;
+        }
+
+        var itemGA = new GlideAggregate('x_att2_abs_procure_abspl_order_sub_line_item');
+        itemGA.addQuery('order_summary_key', this.ABSPLOrder.sys_id);
+        itemGA.addAggregate('COUNT');
+        itemGA.query();
+        if (itemGA.next()) {
+            return itemGA.getAggregate('COUNT');
+        } else {
+            return 0;
+        }
+    },
+
+    _getOrderItemXMLString: function(ABSPLOrderItem) {
+        if (!(ABSPLOrderItem && ABSPLOrderItem.isValidRecord())) {
+            this._logError(null, 'Internal error: Could not generate item XML string--Order record is not valid', false);
+            return false;
+        }
+        var strXMLTemplate = "<ns1:exportOrderItem>" +
+            "<ns1:recordOperation>CREATE</ns1:recordOperation>" +
+            "<ns1:partNumberManufact>" + this._escapeForXMLText(ABSPLOrderItem.model.model_number + '') + "</ns1:partNumberManufact>" +
+            "<ns1:itemNumber>" + ABSPLOrderItem.order_line_number + "</ns1:itemNumber>" +
+            "<ns1:itemDescription>" + this._escapeForXMLText(ABSPLOrderItem.model.short_description + '') + "</ns1:itemDescription>" +
+            "<ns1:itemQuantity>" + ABSPLOrderItem.quantity + "</ns1:itemQuantity>" +
+            "<ns1:quantityUnitMeasure>EA</ns1:quantityUnitMeasure>" +
+            "<ns1:unitPrice>" + ABSPLOrderItem.at_t_price + "</ns1:unitPrice>" +
+            "<ns1:totalPrice>" + ABSPLOrderItem.at_t_total_price + "</ns1:totalPrice>" +
+            "<ns1:exportOrderItemManufacturer>" +
+            "<ns1:partnerCode>" + this._escapeForXMLText(ABSPLOrderItem.manufacturer + '') + "</ns1:partnerCode>" +
+            "</ns1:exportOrderItemManufacturer>" +
+            "</ns1:exportOrderItem>";
+
+        return strXMLTemplate;
+    },
+
+    _getInvoiceItemXMLString: function(ABSPLOrderItem) {
+        if (!(ABSPLOrderItem && ABSPLOrderItem.isValidRecord())) {
+            this._logError(null, 'Internal error: Could not generate item XML string--Order record is not valid', false);
+            return false;
+        }
+
+        var strXMLTemplate = "<n0:exportInvoiceItem>" +
+            "<n0:recordOperation>CREATE</n0:recordOperation>" +
+            "<n0:numItem>" + ABSPLOrderItem.order_line_key.order_line_number + "</n0:numItem>" +
+            "<n0:organizationPartNumber>" + this._escapeForXMLText(ABSPLOrderItem.model.model_number + '') + "</n0:organizationPartNumber>" +
+            "<n0:itemDescription>" + this._escapeForXMLText(ABSPLOrderItem.model.short_description + '') + "</n0:itemDescription>" +
+            "<n0:quantity>1</n0:quantity>" +
+            "<n0:unitMeasureQuantity>EA</n0:unitMeasureQuantity>" +
+            "<n0:unitMeasureWeight>" + this.weightUnit + "</n0:unitMeasureWeight>" +
+            "<n0:unitPrice>" + ABSPLOrderItem.order_line_key.at_t_price + "</n0:unitPrice>" +
+            "<n0:totalPriceItem>" + ABSPLOrderItem.order_line_key.at_t_price + "</n0:totalPriceItem>" +
+            "<n0:netWeight>" + (this.weightUnit == 'LB' ? ABSPLOrderItem.net_weight_lb : ABSPLOrderItem.net_weight_kg) + "</n0:netWeight>" +
+            "<n0:originDocument>" + ABSPLOrderItem.country_of_origin + "</n0:originDocument>" + /* CountryOfOrigin */
+            "<n0:attributeType>" + (ABSPLOrderItem.hazmat + '' == 'true' ? 'Y' : 'N') + "</n0:attributeType>" + /* HazMatFlag */
+            "<n0:flexField1>USD|USD</n0:flexField1>" + /* Currency Code | Commercial Currency Code */
+            "<n0:flexField2>" + ABSPLOrderItem.order_line_key.at_t_total_price + "|" + ABSPLOrderItem.order_line_key.at_t_total_price + "</n0:flexField2>" + /* CommercialValue | TotalCommercialValue */
+            "<n0:flexField3>" + this._escapeForXMLText(ABSPLOrderItem.serial_number + '') + '|' + ABSPLOrderItem.sub_line_number + '|' + ABSPLOrderItem.order_line_key.configuration_sequence_number + "</n0:flexField3>" +
+            "</n0:exportInvoiceItem>";
+
+        return strXMLTemplate;
+    },
+
+    _formatAddress: function(arrPieces) {
+        if (!arrPieces || !Array.isArray(arrPieces))
+            return 'Invalid address array';
+
+        var cleanedArray = arrPieces.filter(function(a) {
+            return a !== '';
+        });
+        var strAddress = cleanedArray.join(', ').replace(/(\r\n|\n|\r)/gm, ', ');
+
+        return strAddress;
+    },
+
+    _createInterventionTask: function(orderGR, msg) {
+
+        var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+        taskGR.initialize();
+        taskGR.assignment_group = this._errGrp;
+        taskGR.task_type = 'Integration Error';
+        taskGR.short_description = 'Export compliance integration problem';
+        if (orderGR && orderGR.isValidRecord()) {
+            taskGR.short_description += ' for ' + orderGR.getDisplayValue() + ' (' + orderGR.getClassDisplayValue() + ')';
+            taskGR.order_summary = orderGR.sys_id + "";
+        }
+        taskGR.description = "There was a problem with the export compliance integration. Check the EOL processing log for more details (if available).";
+        if (msg)
+            taskGR.description += ('\n"' + msg + '"');
+        taskGR.insert();
+        return {
+            number: taskGR.number + '',
+            sys_id: taskGR.sys_id + ''
+        };
+    },
+
+    _executeRequest: function(ABSPLOrder, soapReq, soapFunc) {
+        var response = soapReq.execute();
+        var status = response.getStatusCode();
+        var checkDisplay = ABSPLExportCompliance.STATE_TO_CHECK_MAP[ABSPLOrder.state + ''];
+
+        //Log Integration Details
+        var integrationLog = new ABSPLIntegrationLog("OneSource", "Outbound", "SOAP");
+        integrationLog.setRequest('Post', soapReq.getRequestBody(), soapReq.getEndpoint(), soapFunc);
+        integrationLog.setResponse(response.getBody(), status);
+        integrationLog.setTableInstance("x_att2_abs_procure_abspl_order_summary", ABSPLOrder.sys_id + '');
+
+        this.LOG.unshift('Submitted to ONESOURCE for compliance (' + (checkDisplay || ABSPLOrder.state) + ') -- ' + new GlideDateTime() + ' (GMT)');
+        this.LOG.push('Response Status: ' + status);
+        if (status.toString()[0] == '2') {
+            integrationLog.setLogStatus('Processed');
+            integrationLog.update();
+            return true;
+        } else if (status.toString()[0] == '4' || status.toString()[0] == '5') {
+            integrationLog.setLogStatus('Error');
+            integrationLog.update();
+            this._logError(ABSPLOrder, 'Failed to submit compliance check request. HTTP Response: ' + status, false);
+            return false;
+        }
+    },
+
+    _logError: function(orderGR, msg, createTask) {
+        var interTask;
+        //gs.info('ABSPL error: ' + msg);
+        if (createTask + '' === 'true')
+            interTask = this._createInterventionTask(orderGR, msg);
+
+        this.LOG.unshift('(ERROR) ' + msg);
+        if (interTask)
+            this.LOG.push('Task created for manual intervention: ' + interTask.number);
+    },
+
+    _escapeForXMLText: function(str) {
+        var result = str.replaceAll('&', '&amp;');
+        result = result.replaceAll('<', '&lt;');
+        result = result.replaceAll('>', '&gt;');
+        return result;
+    },
+
+    type: 'ABSPLExportCompliance'
+};
+
+ABSPLExportCompliance.processInboundUpdate = function(request, response, soapRequestXML) {
+    var STATUS_MAP = {
+        'H': 'Compliance Hold',
+        'P': 'Compliance Processed',
+        'E': 'Compliance Error',
+        'O': 'Compliance Processed'
+    };
+    var COMP_DISPLAY = {
+        'H': 'Compliance Hold',
+        'P': 'Compliance Processed',
+        'E': 'Compliance Error',
+        'O': 'Compliance Override'
+    };
+    var CHECK_DISPLAY = {
+        'check1': 'Check 1',
+        'check2': 'Check 2',
+        'check2-update': 'Check 2'
+    };
+
+    var hasError = false,
+        taskCreated = false,
+        updateItems = true;
+    var LOG = [];
+    var orderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+
+    try {
+        var xmlDoc = new XMLDocument2();
+        xmlDoc.parseXML(soapRequestXML);
+        var check = xmlDoc.getNodeText("//HEADER/FUNCTIONALITY").toLowerCase(); // "Check1", "Check2", "Check2-Update"
+        var docType = xmlDoc.getNodeText("//HEADER/DOC_TYPE").toLowerCase(); // "Import","Export"
+        var docIdent = xmlDoc.getNodeText("//HEADER/DOC_IDENTIFIER"); // EOL Number
+        var compCode = xmlDoc.getNodeText("//HEADER/COMPLIANCE_STATUS"); // "H","P","E","O"
+        if (!check || !docIdent || !compCode)
+            throw new Error('Improperly formatted request body');
+
+        var compDisp = COMP_DISPLAY[compCode];
+        var compState = STATUS_MAP[compCode];
+        var reqMsgs = xmlDoc.getNodeText("//HEADER/MESSAGE").split('|');
+
+        if (orderGR.get('eol_number', docIdent)) {
+
+            var itemTable, orderField, lineNumField, lineEnvField;
+            var checkDisplay = CHECK_DISPLAY[check];
+
+            if (['Check 2', 'Check 1'].indexOf(orderGR.state + '') < 0)
+                updateItems = false;
+            // if (ABSPLExportCompliance.STATE_TO_CHECK_MAP[orderGR.state + ''] != checkDisplay)
+            //     throw new Error('Cannot process ' + checkDisplay + ' update when order state is ' + orderGR.state);
+
+            if (checkDisplay == 'Check 1') {
+                itemTable = 'x_att2_abs_procure_abspl_order_line_item';
+                orderField = 'order';
+            } else if (checkDisplay == 'Check 2' || checkDisplay == 'Check 3') {
+                itemTable = 'x_att2_abs_procure_abspl_order_sub_line_item';
+                orderField = 'order_summary_key';
+            } else {
+                throw new Error('Improperly formatted request body, no valid functionality value');
+            }
+
+            if (itemTable == 'x_att2_abs_procure_abspl_order_sub_line_item') {
+                lineNumField = 'sub_line_number';
+                lineEnvField = 'SUBLINE_NUMBER';
+            } else if (itemTable == 'x_att2_abs_procure_abspl_order_line_item') {
+                lineNumField = 'order_line_number';
+                lineEnvField = 'LINE_NUMBER';
+            } else {
+                throw new Error('Internal processing error. Invalid table name: ' + itemTable);
+            }
+
+            itemGR = new GlideRecord(itemTable);
+            itemGR.addQuery(orderField, orderGR.sys_id + "");
+            itemGR.addQuery('state', '!=', 'Cancelled');
+            itemGR.orderBy(lineNumField);
+            itemGR.query();
+            var itemNode = xmlDoc.getFirstNode('//LINE_ITEM');
+            var itemObj = {
+                length: 0,
+                passed: 0,
+                npassed: 0
+            };
+            while (itemNode) {
+                // iterate "<LINE_ITEM>" nodes and populate itemObj with child node names and values
+                var nodeVals = {};
+                var childIter = itemNode.getChildNodeIterator();
+                while (childIter.hasNext()) {
+                    var childNode = childIter.next();
+                    nodeVals[childNode.getNodeName()] = childNode.getTextContent();
+                }
+
+                if (nodeVals.hasOwnProperty(lineEnvField) && !global.JSUtil.nil(nodeVals[lineEnvField])) {
+                    itemObj[nodeVals[lineEnvField]] = nodeVals;
+                }
+
+                if (nodeVals.hasOwnProperty('MESSAGE') && (nodeVals.MESSAGE.toString().toLowerCase() == 'passed' || nodeVals.MESSAGE == '')) {
+                    itemObj.passed++;
+                } else {
+                    itemObj.npassed++;
+                }
+
+                itemObj.length++;
+                itemNode = xmlDoc.getNextNode(itemNode);
+            }
+
+            if (itemObj.length != itemGR.getRowCount())
+                throw new Error('Inbound line item count (' + itemObj.length + ') does not match order item count (' + itemGR.getRowCount() + ')');
+            // if (compState != 'Compliance Processed' && itemObj.npassed <= 0)
+            //     throw new Error('Order status ' + compDisp + ' requires at least one non-passing line item');
+            if (compState == 'Compliance Processed' && itemObj.passed != itemObj.length)
+                throw new Error('Cannot have an order status of ' + compDisp + ' when 1 or more line items have not been indicated as "Passed"');
+
+            while (itemGR.next()) {
+                var grLineNum = itemGR.getValue(lineNumField);
+
+                var grPartNum = itemGR.model.model_number + '';
+
+                if (!itemObj[grLineNum])
+                    throw new Error('Missing status for is required for order line ' + grLineNum);
+
+                if (itemObj[grLineNum]) {
+                    if (itemObj[grLineNum].hasOwnProperty('PART_NUMBER')) {
+                        var inPartNum = itemObj[grLineNum].PART_NUMBER;
+                        if (inPartNum != grPartNum)
+                            throw new Error('Part number mismatch for line ' + grLineNum + ', part number "' + inPartNum + '" / "' + grPartNum + '"');
+                    } else {
+                        throw new Error('No part number indicated within incoming payload for line ' + grLineNum + ', part number "' + grPartNum + '"');
+                    }
+
+                    if (lineEnvField == 'SUBLINE_NUMBER' && itemGR.order_line_key.order_line_number + '' != itemObj[grLineNum].LINE_NUMBER)
+                        throw new Error('Parent line number mismatch for line ' + grLineNum);
+
+                    // if (checkDisplay == 'Check 2' && !itemObj[grLineNum].SERIAL_NUMBER)
+                    //    throw new Error('Serial number required for line ' + grLineNum);
+
+                    // if (checkDisplay == 'Check 2' && itemGR.serial_number.toString().toLowerCase() != (itemObj[grLineNum].SERIAL_NUMBER+'').toLowerCase())
+                    //     throw new Error('Serial number mismatch for line ' + grLineNum + ' -- "' + itemObj[grLineNum].SERIAL_NUMBER + '" does not match "' + itemGR.serial_number + '"');
+
+                    if (itemObj[grLineNum].hasOwnProperty('ECNNUM')) {
+                        if (orderGR.mark_for_country.iso3166_2.toString() == 'PL' && itemObj[grLineNum].ECNNUM == '5A002') {
+                            LOG.push('Line ' + grLineNum + ': Encrypted item indicated. ABW for required.');
+                            new ABSPLCommonUtil().createOrderTask(orderGR, 'Export Compliance', 'Complete ABW form for encrypted items', 'Please complete the ABW form, required before shipping ' + itemGR.model.model_number + ' to ' + orderGR.mark_for_country.name + '.\nA 14-day hold period will begin AFTER this task has been closed.', '7cfe95a093ff8ad44c18f8f17cba1027' /* Compliance Specialist */ );
+                        }
+                    }
+
+                    if (itemObj[grLineNum].hasOwnProperty('MESSAGE') && itemObj[grLineNum].MESSAGE != '') {
+                        var lineMsgs = itemObj[grLineNum].MESSAGE.split('|');
+                        lineMsgs.forEach(function(msg) {
+                            LOG.push('Line ' + grLineNum + ': ' + msg);
+                        });
+                    }
+
+                } else {
+                    throw new Error('Missing status for line ' + grLineNum + ', part number "' + grPartNum + '"');
+                }
+
+                if (updateItems) {
+                    if (compState.toLowerCase().indexOf('processed') >= 0 && itemObj[grLineNum].hasOwnProperty('MESSAGE') && (itemObj[grLineNum].MESSAGE.toLowerCase() == 'passed' || itemObj[grLineNum].MESSAGE == ''))
+                        itemGR.setValue('state', STATUS_MAP['P']);
+                    else
+                        itemGR.setValue('state', compState);
+                    itemGR.update();
+                }
+            }
+
+            var successMsg = docIdent + ' processed. Check log for any errors, warnings, or informational messages.';
+            response.status = 'success';
+            response.message = successMsg;
+            // LOG.push(successMsg);
+        } else {
+            throw new Error('Could not locate record ' + docIdent);
+        }
+    } catch (ex) {
+        response.status = 'failed';
+        response.message = ex.message;
+
+        _logError(orderGR, ex.message, false);
+    } finally {
+        if (orderGR && orderGR.isValidRecord()) {
+            if (!taskCreated && compState.toString().toLowerCase().indexOf('processed') < 0)
+                _createInterventionTask(orderGR, reqMsgs);
+
+            var messages = ["Compliance update received (" + checkDisplay + ', ' + docType + ")"];
+            messages.push("Status: " + (hasError ? 'ERROR' : compDisp));
+            if (!hasError && reqMsgs.length > 0)
+                messages.push("Messages: \n    --> " + reqMsgs.join('\n    --> '));
+            if (LOG.length > 0)
+                messages = messages.concat(LOG);
+
+            new ABSPLCommonUtil().updateProcessingLog(orderGR, messages);
+
+            orderGR.setWorkflow(false);
+            orderGR.update();
+            // also update out of stock task if applicable
+            var orderTaskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+            orderTaskGR.addQuery('order_summary', orderGR.sys_id + "");
+            orderTaskGR.addQuery('task_type', 'EOL Out of stock');
+            orderTaskGR.query();
+            if (orderTaskGR.next()) {
+                orderTaskGR.description += "\n\n" + message.join('\n\n');
+                orderTaskGR.update();
+            }
+        }
+
+        var httpStatus = hasError ? 'failure' : 'success';
+        var integrationLog = new ABSPLIntegrationLog("OneSource", "Inbound", "SOAP");
+        integrationLog.setRequest('POST', soapRequestXML, '/x_att2_abs_procure_UpdateCompliance.do?SOAP');
+        integrationLog.setResponse('LOG:\n  -> ' + LOG.join('\n  -> '), httpStatus);
+        integrationLog.setTableInstance("x_att2_abs_procure_abspl_order_summary", orderGR.sys_id + '');
+        if (hasError)
+            integrationLog.setLogStatus('Error');
+        else
+            integrationLog.setLogStatus('Processed');
+        integrationLog.update();
+
+        response.LOG = LOG.join('|');
+    }
+
+    function _createInterventionTask(orderRecord, msg) {
+        var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+        taskGR.initialize();
+        if (orderRecord && orderRecord.isValidRecord())
+            taskGR.order_summary = orderRecord.sys_id + '';
+        taskGR.assignment_group = this._errGrp;
+        taskGR.short_description = 'Export compliance integration problem';
+        taskGR.task_type = 'Integration Error';
+        taskGR.description = "There was a problem with the compliance check request for this order. See order processing log for more details (if available).";
+        if (msg)
+            taskGR.description += ('\n  -> ' + msg);
+        taskGR.insert();
+        LOG.push('Task created for manual intervention: ' + taskGR.number);
+        taskCreated = true;
+    }
+
+    function _logError(orderRec, msg, createTask) {
+        hasError = true;
+        LOG.push('ERROR: ' + msg);
+
+        if (createTask + '' === 'true')
+            _createInterventionTask(orderRec, msg);
+    }
+};
