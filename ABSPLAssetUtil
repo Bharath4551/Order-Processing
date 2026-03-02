@@ -10,20 +10,25 @@ ABSPLAssetUtil.prototype = {
         return this.HW_ASSET_STATUS_MAP;
     },
 
-    getHWAssetGRFromSN: function(model_number, manufacturer, serial_number, allow_create) {
-        if (!model_number || !serial_number)
+    getHWAssetGRFromSN: function(model_id, model_number, manufacturer, serial_number, asset_tag, allow_create) {
+        if (!(model_number || model_id) || !serial_number)
             return false;
+		
+		var assetGR;
+		
+		if (model_id)
+			assetGR = this._getHWAssetGRFromSN(model_id, model_number, manufacturer, serial_number, asset_tag);
+		
+		if (!(assetGR && assetGR.hasNext()))
+			assetGR = this._getHWAssetGRFromSN(null, model_number, manufacturer, serial_number, asset_tag);
 
-        var assetGR = new GlideRecord('alm_hardware');
-        assetGR.addQuery('model.model_number', model_number);
-        assetGR.addQuery('serial_number', serial_number);
-        assetGR.query();
+		// all searching done... check conditions and error, return relevant assetGR, or create if allowed
         if (assetGR.getRowCount() > 1) {
-            throw new Error('Multiple assets found with the same model and serial number');
+            throw new Error('Multiple assets found with the same model and serial number or asset tag: ' + model_number + ' | ' + serial_number + ' | ' + asset_tag);
         } else if (assetGR.next()) {
             return assetGR;
         } else if (allow_create + '' === 'true') {
-            if (assetGR.get(this.createNewHWAsset(model_number, manufacturer, serial_number)))
+            if (assetGR.get(this.createNewHWAsset(model_number, manufacturer, serial_number, asset_tag, model_id)))
                 return assetGR;
             else
                 throw new Error('Asset could not be created with model, manufacturer, and serial number provided: ' + model_number + ' | ' + manufacturer + ' | ' + serial_number);
@@ -32,11 +37,56 @@ ABSPLAssetUtil.prototype = {
         return false;
     },
 
-    createNewHWAsset: function(model_number, manufacturer, serial_number, asset_tag) {
+	_getHWAssetGRFromSN: function(model_id, model_number, manufacturer, serial_number, asset_tag) {
+		var assetGR = new GlideRecord('alm_hardware');
+        assetGR.addNotNullQuery('model');
+
+		// if given a specific model sys_id, use that
+        if (model_id)
+            assetGR.addQuery('model', model_id);
+		
+		// regardless, model number must match
+        assetGR.addQuery('model.model_number', model_number);
+
+		// first search by serial number only
+        var snQuery = assetGR.addQuery('serial_number', serial_number);
+        assetGR.query();
+
+		// if more than one asset found by serial number, and we're given an asset tag, try searching by serial number + asset tag
+		if (assetGR.getRowCount() > 1 && asset_tag) {
+            var atQuery = assetGR.addQuery('asset_tag', asset_tag);
+			assetGR.query();
+
+			// if that eliminated all results, nullify asset tag query -- should hit multiple assets error
+			if (!assetGR.hasNext()) {
+				atQuery.addOrCondition('serial_number', serial_number);
+				assetGR.query();
+			}
+		}
+
+		// ELSE if we didn't find any assets by serial number, and we're given an asset tag, try searching by serial number OR asset tag
+        else if (!assetGR.hasNext() && asset_tag) {
+            snQuery.addOrCondition('asset_tag', asset_tag);
+            assetGR.query();
+        }
+
+		return assetGR;
+	},
+
+    createNewHWAsset: function(model_number, manufacturer, serial_number, asset_tag, model_id) {
         if (!model_number || !manufacturer || !serial_number)
             return false;
+		
+		var model;
 
-        var model = this.getModelRecord(model_number, manufacturer);
+		if (model_id) {
+			model = new GlideRecord('cmdb_hardware_product_model');
+			model.get(model_id);
+		}
+
+		if (!(model && model.isValidRecord()))
+			model = this.getModelRecord(model_number, manufacturer);
+
         if (model && model.isValidRecord() && model.sys_class_name.toString() == 'cmdb_hardware_product_model') {
             var createAssetGR = new GlideRecord('alm_hardware');
             createAssetGR.initialize();
@@ -55,6 +105,7 @@ ABSPLAssetUtil.prototype = {
     },
 
     moveConsumableAssets: function(manufacturer, model_number, stockroom_from, stockroom_to, quantity) {
+        var assetGR, createAssetGR;
         var consumable = false;
         var software = false;
         var model_id = '';
@@ -80,22 +131,24 @@ ABSPLAssetUtil.prototype = {
             }
         }
         if (consumable) {
-            var assetGR = new GlideRecord('alm_consumable');
-            assetGR.addQuery('model', model_id);
-            assetGR.addQuery('stockroom', stockroom_from);
-            assetGR.query();
-            if (assetGR.next()) {
-                assetGR.quantity = assetGR.quantity - parseInt(quantity, 10);
-                assetGR.update();
+            var assetFromGR = new GlideRecord('alm_consumable');
+            assetFromGR.addQuery('model', model_id);
+            assetFromGR.addQuery('stockroom', stockroom_from);
+            assetFromGR.query();
+            if (assetFromGR.next()) {
+                assetFromGR.quantity = parseInt(assetFromGR.getValue('quantity'), 10) - parseInt(quantity, 10);
+                assetFromGR.update();
+                assetGR = assetFromGR;
             }
 
-            var assetGR = new GlideRecord('alm_consumable');
-            assetGR.addQuery('model', model_id);
-            assetGR.addQuery('stockroom', stockroom_to);
-            assetGR.query();
-            if (assetGR.next()) {
-                assetGR.quantity = assetGR.quantity + parseInt(quantity, 10);
-                assetGR.update();
+            var assetToGR = new GlideRecord('alm_consumable');
+            assetToGR.addQuery('model', model_id);
+            assetToGR.addQuery('stockroom', stockroom_to);
+            assetToGR.query();
+            if (assetToGR.next()) {
+                assetToGR.quantity = parseInt(assetToGR.getValue('quantity'), 10) + parseInt(quantity, 10);
+                assetToGR.update();
+                assetGR = assetToGR;
             } else {
                 createAssetGR = new GlideRecord('alm_consumable');
                 createAssetGR.initialize();
@@ -106,27 +159,30 @@ ABSPLAssetUtil.prototype = {
                 createAssetGR.install_status = '6';
                 createAssetGR.substatus = 'available';
                 createAssetGR.insert();
+                assetGR = createAssetGR;
             }
         }
         if (software) {
-            var softwareGR = new GlideRecord('alm_license');
-            softwareGR.addQuery('software_model', model_id);
-            softwareGR.addQuery('stockroom', stockroom_from);
-            softwareGR.query();
-            if (softwareGR.next()) {
-                softwareGR.purchased_rights = softwareGR.purchased_rights - parseInt(quantity, 10);
-				softwareGR.quantity = softwareGR.quantity - parseInt(quantity, 10);
-                softwareGR.update();
+            var softwareFromGR = new GlideRecord('alm_license');
+            softwareFromGR.addQuery('software_model', model_id);
+            softwareFromGR.addQuery('stockroom', stockroom_from);
+            softwareFromGR.query();
+            if (softwareFromGR.next()) {
+                softwareFromGR.purchased_rights = parseInt(softwareFromGR.getValue('purchased_rights'), 10) - parseInt(quantity, 10);
+                softwareFromGR.quantity = parseInt(softwareFromGR.getValue('quantity'), 10) - parseInt(quantity, 10);
+                softwareFromGR.update();
+                assetGR = softwareFromGR;
             } else {
-                var softwareGR = new GlideRecord('alm_license');
-                softwareGR.addQuery('software_model', model_id);
-                softwareGR.addQuery('stockroom', stockroom_to);
-                softwareGR.addQuery('software_model.edition', "ABSPL");
-                softwareGR.query();
-                if (softwareGR.next()) {
-                    softwareGR.purchased_rights = softwareGR.purchased_rights - parseInt(quantity, 10);
-					softwareGR.quantity = softwareGR.quantity - parseInt(quantity, 10);
-                    softwareGR.update();
+                var softwareToGR = new GlideRecord('alm_license');
+                softwareToGR.addQuery('software_model', model_id);
+                softwareToGR.addQuery('stockroom', stockroom_to);
+                softwareToGR.addQuery('software_model.edition', "ABSPL");
+                softwareToGR.query();
+                if (softwareToGR.next()) {
+                    softwareToGR.purchased_rights = parseInt(softwareToGR.getValue('purchased_rights'), 10) - parseInt(quantity, 10);
+                    softwareToGR.quantity = parseInt(softwareToGR.getValue('quantity'), 10) - parseInt(quantity, 10);
+                    softwareToGR.update();
+                    assetGR = softwareToGR;
                 } else {
                     createAssetGR = new GlideRecord('alm_license');
                     createAssetGR.initialize();
@@ -137,6 +193,7 @@ ABSPLAssetUtil.prototype = {
                     createAssetGR.install_status = '6';
                     createAssetGR.substatus = 'available';
                     createAssetGR.insert();
+                    assetGR = createAssetGR;
                 }
             }
         }
@@ -199,7 +256,7 @@ ABSPLAssetUtil.prototype = {
                 softwareGR.query();
                 if (softwareGR.next()) {
                     softwareGR.purchased_rights = softwareGR.purchased_rights + parseInt(quantity, 10);
-					softwareGR.quantity = softwareGR.quantity + parseInt(quantity, 10);
+                    softwareGR.quantity = softwareGR.quantity + parseInt(quantity, 10);
                     softwareGR.update();
                 } else {
                     createAssetGR = new GlideRecord('alm_license');
@@ -210,7 +267,7 @@ ABSPLAssetUtil.prototype = {
                     createAssetGR.install_status = 6; // In Stock
                     createAssetGR.substatus = 'available';
                     createAssetGR.purchased_rights = parseInt(quantity, 10);
-					createAssetGR.quantity = parseInt(quantity, 10);
+                    createAssetGR.quantity = parseInt(quantity, 10);
                     createAssetGR.insert();
                 }
             }
@@ -282,7 +339,7 @@ ABSPLAssetUtil.prototype = {
         var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
         subLineGR.addQuery('order_summary_key', orderSysId);
         subLineGR.addQuery('state', '!=', 'Cancelled');
-		subLineGR.addQuery('model.sys_class_name', 'cmdb_hardware_product_model');
+        subLineGR.addQuery('model.sys_class_name', 'cmdb_hardware_product_model');
         subLineGR.addNotNullQuery('asset');
         subLineGR.query();
         while (subLineGR.next())
@@ -377,7 +434,7 @@ ABSPLAssetUtil.HW_ASSET_STATUS_MAP = {
     },
     "missing": {
         "status": 8 /* Missing */ ,
-        "substatus": "lost"
+        "substatus": ""
     },
     "donate": {
         "status": 7 /* Retired */ ,
@@ -459,23 +516,23 @@ ABSPLAssetUtil.HW_ASSET_STATUS_MAP = {
         "status": 6 /* In Stock */ ,
         "substatus": "pending_disposal"
     },
-	"resell": {
+    "resell": {
         "status": 6 /* In Stock */ ,
         "substatus": "pending_disposal"
     },
-	"onsite": {
+    "onsite": {
         "status": 6 /* In Stock */ ,
         "substatus": "pending_disposal"
     },
-	"obf": {
+    "obf": {
         "status": 6 /* In Stock */ ,
         "substatus": "pending_disposal"
     },
-	"na": {
+    "na": {
         "status": 6 /* In Stock */ ,
         "substatus": "pending_disposal"
     },
-	"test": {
+    "test": {
         "status": 6 /* In Stock */ ,
         "substatus": "pending_disposal"
     },
@@ -483,12 +540,24 @@ ABSPLAssetUtil.HW_ASSET_STATUS_MAP = {
         "status": 6 /* In Stock */ ,
         "substatus": "available"
     },
-	"migrated": {
+    "migrated": {
         "status": 1 /* In Use */ ,
         "substatus": ""
     },
-	"spare": {
+    "spare": {
         "status": 3 /* In maintenance */ ,
         "substatus": ""
+    },
+    "retire": {
+        "status": 7 /* Retired */ ,
+        "substatus": "disposed"
+    },
+    "retired": {
+        "status": 7 /* Retired */ ,
+        "substatus": "disposed"
+    },
+    "lost": {
+        "status": 8 /* Missing */ ,
+        "substatus": "lost"
     }
 };
