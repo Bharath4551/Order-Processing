@@ -8,7 +8,7 @@ ABSPLEquipmentOrderRest.prototype = {
         var commUtil = new ABSPLCommonUtil();
 
         //Log Integration Details
-        var integrationLog = new x_att2_abs_procure.ABSPLIntegrationLog('CTDI', "Inbound", 'REST');
+        var integrationLog = new x_att2_abs_procure.ABSPLIntegrationLog('CTDI', 'Inbound', 'REST');
         integrationLog.setRequest('Post', JSON.stringify(requestData), request.url, 'ABSPLEquipmentOrderRest', 'processLabelSent', request.headers);
 
         var serviceRequest = requestData.SR + '';
@@ -230,6 +230,7 @@ ABSPLEquipmentOrderRest.prototype = {
         var requestData = request.body.data;
         var commUtil = new ABSPLCommonUtil();
         var assetUtil = new ABSPLAssetUtil();
+        var iStack = commUtil.getInstanceStack();
         var LOG = [];
 
         try {
@@ -237,9 +238,9 @@ ABSPLEquipmentOrderRest.prototype = {
             var integrationLog = new x_att2_abs_procure.ABSPLIntegrationLog('CTDI', 'Inbound', 'REST');
             integrationLog.setRequest('POST', JSON.stringify(requestData), request.url, 'ABSPLEquipmentOrderRest', 'processPartsRecovered', request.headers);
 
-            var serviceRequest = requestData.SR + '';
-            var warehouseID = requestData.WarehouseID + '';
-            var warehouseLocation = requestData.WarehouseLocation + '';
+            var serviceRequest = requestData.SR;
+            var warehouseID = requestData.WarehouseID;
+            var warehouseLocation = requestData.WarehouseLocation;
             var responseStatus = 'Success';
             var responseMsg = '';
             var responseCode = '200';
@@ -282,11 +283,11 @@ ABSPLEquipmentOrderRest.prototype = {
 
                 for (var listIdx = 0; listIdx < partsList.length; listIdx++) {
                     var partData = partsList[listIdx];
-                    var partNumber = partData.ManPartNumber + '';
-                    var serialNumber = partData.SerialNumber + '';
-                    var mfgr = (partData.Manufacturer || partData.ManName) + '';
-                    var assetTag = partData.AssetTag + '';
-                    var disposition = partData.Disposition + '';
+                    var partNumber = partData.ManPartNumber;
+                    var serialNumber = partData.SerialNumber;
+                    var mfgr = partData.Manufacturer || partData.ManName;
+                    var assetTag = partData.AssetTag;
+                    var disposition = partData.Disposition;
                     var modelSysId = '';
                     var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
                     subLineGR.addQuery('state', 'IN', 'Pending Return, Pending Disposition, Needs Review, Not Recovered');
@@ -309,6 +310,9 @@ ABSPLEquipmentOrderRest.prototype = {
                             eolNum = orderSummaryRec.eol_number + '';
                             if (!eolList.includes(eolNum))
                                 eolList.push(eolNum);
+
+                            //if (orderSummaryRec.company_name.toString().toLowerCase().replace(/of|the| /gi, '') == 'departmenttreasury')
+                                //disposition = 'scrapped';
 
                             var partcheck = checkLineParts(partNumber, orderSummaryRec);
                             if (!partcheck.success) {
@@ -335,15 +339,18 @@ ABSPLEquipmentOrderRest.prototype = {
                                     subLineGR.setValue('warehouse_location', partData.WarehouseLocation || warehouseLocation);
                                     subLineGR.update();
                                 }
+
+                                updateAsset(partNumber, mfgr, assetTag, serialNumber, disposition, warehouseLocation, "");
                             }
                         }
                     } else {
-                        updateAsset(partNumber, assetTag, serialNumber, disposition, warehouseLocation, "");
+                        if (!serialNumber)
+                            updateAsset(partNumber, mfgr, assetTag, serialNumber, disposition, warehouseLocation, "");
                     }
 
                     if (serialNumber) {
                         // Search for all open line items on return orders waiting for this asset, mark as recovered
-                        var assetGR = assetUtil.getHWAssetGRFromSN(partNumber, mfgr, serialNumber, true);
+                        var assetGR = assetUtil.getHWAssetGRFromSN(null/*model sys_id*/, partNumber, mfgr, serialNumber, assetTag, true);
                         if (assetGR && assetGR.isValidRecord()) {
                             var model_category = assetGR.model_category + '';
                             if (model_category == 'cceb7454c3031000b959fd251eba8f2d' || model_category == 'bceb7454c3031000b959fd251eba8f42')
@@ -368,11 +375,12 @@ ABSPLEquipmentOrderRest.prototype = {
                                 subLineGR.updateMultiple();
                             } else {
                                 //Create Serial Number Mismatch Task
-                                createTask(orderSummaryRec, 'Unexpected serial number "' + serialNumber + '" recovered for part number "' + partNumber + '"');
+                                if (orderSummaryRec && orderSummaryRec.isValidRecord())
+                                    createTask(orderSummaryRec, 'Unexpected serial number "' + serialNumber + '" recovered for part number "' + partNumber + '"');
                                 LOG.push('Unexpected serial number "' + serialNumber + '" recovered for part number "' + partNumber + '"');
                             }
 
-                            updateAsset(partNumber, assetTag, serialNumber, disposition, warehouseLocation, assetGR.model + "");
+                            updateAsset(partNumber, mfgr, assetTag, serialNumber, disposition, warehouseLocation, assetGR.model + "");
                         }
                     }
                 }
@@ -420,7 +428,7 @@ ABSPLEquipmentOrderRest.prototype = {
         } catch (e) {
             responseCode = 500;
             responseStatus = 'Error';
-            responseMsg = 'ABSPL server error: ' + JSON.stringify(e);
+            responseMsg = 'ABSPL server error: ' + e.message + (e.stack ? e.stack : '');
         }
 
         if (responseStatus == 'Success')
@@ -455,6 +463,7 @@ ABSPLEquipmentOrderRest.prototype = {
                 for (var listIdx = 0; listIdx < partsList.length; listIdx++) {
                     var partData = partsList[listIdx];
                     var partNumber = partData.ManPartNumber + '';
+                    var mfgr = (partData.Manufacturer || partData.ManName) + '';
                     var serialNumber = partData.SerialNumber + '';
                     var disposition = partData.Disposition + '';
                     var dispositionValues = ['Destroy', 'Reuse', 'Sell', 'Scrap', 'Repair', 'Pending Disposal'];
@@ -522,7 +531,7 @@ ABSPLEquipmentOrderRest.prototype = {
                             if (partsMoved[v].serial_number == serialNumber && partsMoved[v].status != 'RECOVERED') {
                                 var model = new GlideRecord('cmdb_model');
                                 if (model.get(partsMoved[v].model + '') && model.model_number == partNumber) {
-                                    partsMoved[v].asset = updateAsset(partNumber, assetTag, serialNumber, disposition, (partData.WarehouseLocation || warehouseLocation), model.sys_id + "");
+                                    partsMoved[v].asset = updateAsset(partNumber, mfgr, assetTag, serialNumber, disposition, (partData.WarehouseLocation || warehouseLocation), model.sys_id + "");
                                     if (warehouseLocation != taskRecord.variables.move_to.getDisplayValue())
                                         partsMoved[v].status = 'RECOVERED WRONG STOCKROOM';
                                     else partsMoved[v].status = 'RECOVERED';
@@ -632,7 +641,44 @@ ABSPLEquipmentOrderRest.prototype = {
             integrationLog.update();
         }
 
-        function updateAsset(partNumber, assetTag, serialNumber, disposition, stockroom, model_id) {
+        function updateAsset(partNumber, manufacturer, assetTag, serialNumber, disposition, stockroom, model_id) {
+            if (iStack == 'FEDGOV' && stockroom == 'COMMON-US') {
+                try {
+                    var fedToCommREST = new sn_ws.RESTMessageV2('ABS to ABS', 'Asset Status');
+                    var iType = commUtil.getInstanceType();
+
+                    if (iType == 'PROD')
+                        fedToCommREST.setStringParameterNoEscape('base_url', 'attcomm.service-now.com');
+                    else if (iType == 'TEST')
+                        fedToCommREST.setStringParameterNoEscape('base_url', 'attcommtest.service-now.com');
+                    else
+                        fedToCommREST.setStringParameterNoEscape('base_url', 'attcommdev5.service-now.com');
+
+                    fedToCommREST.setRequestBody(JSON.stringify({
+                        "SendingSystem": "CTDI",
+                        "Warehouse": "CTDI",
+                        "WarehouseLocation": "COMMON-US",
+                        "ReferenceNumber": "",
+                        "ServiceRequest": 'GCC-' + serviceRequest,
+                        "EOLNumber": 'GCC-' + eolNum,
+                        "ManufacturerPartNumber": partNumber,
+                        "Manufacturer": manufacturer,
+                        "SerialNumber": serialNumber,
+                        "OldSerialNumber": "",
+                        "AssetTag": assetTag,
+                        "Status": disposition,
+                        "Quantity": "1",
+                        "Note": "Updated from GCC recovery"
+                    }));
+                    var response = fedToCommREST.execute();
+                    var responseStatus = response.getStatusCode();
+                    var responseBodyStr = response.getBody();
+                } catch (e) {
+                    gs.error('GCC to COMM asset update error: ' + (e.message || e));
+                    throw e;
+                }
+            }
+
             var assetGR = new GlideRecord('alm_hardware');
             if (model_id != "") {
                 assetGR.addQuery('model', model_id);
@@ -643,38 +689,8 @@ ABSPLEquipmentOrderRest.prototype = {
             assetGR.query();
             if (assetGR.next()) {
                 assetGR.asset_tag = assetTag;
-                if (commUtil.getInstanceStack() == 'FEDGOV') {
-                    try {
-                        assetUtil.setHWAssetStatusFromMap(assetGR, 'sold', false);
-                        var fedToCommREST = new sn_ws.RESTMessageV2('ABS to ABS', 'Asset Status');
-                        var iType = commUtil.getInstanceType;
-                        if (iType == 'PROD')
-                            fedToCommREST.setStringParameterNoEscape('base_url', 'attcomm.service-now.com/');
-                        else if (iType == 'TEST')
-                            fedToCommREST.setStringParameterNoEscape('base_url', 'attcommtest.service-now.com/');
-                        else
-                            fedToCommREST.setStringParameterNoEscape('base_url', 'attcommdev5.service-now.com/');
-                        fedToCommREST.setRequestBody(JSON.stringify({
-                            "SendingSystem": "CTDI",
-                            "Warehouse": "CTDI",
-                            "WarehouseLocation": "COMMON-US",
-                            "ReferenceNumber": "",
-                            "ManufacturerPartNumber": assetGR.model.model_number + '',
-                            "Manufacturer": assetGR.model.manufacturer.name + '',
-                            "SerialNumber": assetGR.serial_number + '',
-                            "OldSerialNumber": "",
-                            "AssetTag": assetGR.asset_tag + '',
-                            "Status": disposition,
-                            "Quantity": "1"
-                        }));
-                        var response = fedToCommREST.execute();
-                        var responseStatus = response.getStatusCode();
-                        var responseBodyStr = response.getBody();
-                        /*if (!responseStatus.startsWith('2'))
-                        	commUtil.createOrderTask()*/
-                    } catch (e) {
-                        gs.error('fedToCommREST ERROR: ' + e);
-                    }
+                if (iStack == 'FEDGOV' && stockroom == 'COMMON-US') {
+                    assetUtil.setHWAssetStatusFromMap(assetGR, 'sold', false);
                 } else {
                     assetUtil.setHWAssetStatusFromMap(assetGR, disposition, false);
                     if (disposition == "Reuse" || disposition == "Repair") {
@@ -688,7 +704,7 @@ ABSPLEquipmentOrderRest.prototype = {
                 }
                 assetGR.update();
                 return assetGR.sys_id + "";
-            } else {
+            } else if (iStack != 'FEDGOV' || stockroom != 'COMMON-US') {
                 // check if it's a hardware model
                 var modelGR = new GlideRecord('cmdb_model');
                 if (model_id) {
@@ -864,6 +880,9 @@ ABSPLEquipmentOrderRest.prototype = {
         }
 
         function createTask(orderGR, description) {
+			if (!orderGR)
+				return;
+				
             var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
             taskGR.addQuery('order_summary', orderGR.sys_id + "");
             taskGR.addQuery('task_type', 'Return Discrepancy');
@@ -936,186 +955,212 @@ ABSPLEquipmentOrderRest.prototype = {
 		"LineSysId": "20a0a6ddba66550bfeda8ebd3961958" 
 		}
 	********************************************/
-
         var assetUtil = new ABSPLAssetUtil();
         var commUtil = new ABSPLCommonUtil();
 
         var requestData = request.body.data;
 
-        //Log Integration Details
-        var integrationLog = new ABSPLIntegrationLog(requestData.SendingSystem, "Inbound", 'REST');
-        integrationLog.setRequest('POST', requestData, request.url, 'ABSPLEquipmentOrderRest', 'processUpdateAsset', request.headers);
+        try {
 
-        var responseStatus = '';
-        var responseMsg = '';
-        var responseCode = 599;
+            //Log Integration Details
+            var integrationLog = new ABSPLIntegrationLog(requestData.SendingSystem, "Inbound", 'REST');
+            integrationLog.setRequest('POST', requestData, request.url, 'ABSPLEquipmentOrderRest', 'processUpdateAsset', request.headers);
 
-        var REQUIRED_FIELDS = ['ManufacturerPartNumber', 'Status', 'EOLNumber', 'SourceSystemLineItemNumber'];
+            var responseStatus = '';
+            var responseMsg = '';
+            var responseCode = 599;
 
-        if (requestData.SendingSystem == "CTDI")
-            REQUIRED_FIELDS = ['ManufacturerPartNumber', 'Status'];
+            var REQUIRED_FIELDS = ['ManufacturerPartNumber', 'Status', 'EOLNumber', 'SourceSystemLineItemNumber'];
 
-        if (requestData.Status && requestData.Status == 'Replaced')
-            REQUIRED_FIELDS = ['ManufacturerPartNumber', 'Status'];
+            if (requestData.SendingSystem == "CTDI")
+                REQUIRED_FIELDS = ['ManufacturerPartNumber', 'Status'];
 
-        var missing_fields = [];
-        for (field in REQUIRED_FIELDS) {
-            if (!requestData[REQUIRED_FIELDS[field]])
-                missing_fields.push(REQUIRED_FIELDS[field]);
-        }
+            if (requestData.SendingSystem == "GPS")
+                REQUIRED_FIELDS = ['ManufacturerPartNumber', 'Status', 'SerialNumber'];
 
-        if (missing_fields.length > 0) {
-            responseCode = 400;
-            responseStatus = 'error';
-            responseMsg = 'Required field/s missing: ' + missing_fields.join(', ');
-        }
+            if (requestData.Status && requestData.Status == 'Replaced')
+                REQUIRED_FIELDS = ['ManufacturerPartNumber', 'Status'];
 
-        if (requestData.SendingSystem != "CTDI") {
-            var orderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
-            if (orderGR.get(requestData.EOLNumber)) {
-                integrationLog.setTableInstance(orderGR.getTableName(), orderGR.getUniqueValue());
+            var missing_fields = [];
+            for (field in REQUIRED_FIELDS) {
+                if (!requestData[REQUIRED_FIELDS[field]])
+                    missing_fields.push(REQUIRED_FIELDS[field]);
             }
-            /* else {
-                           responseCode = 400;
-                           responseStatus = 'error';
-                           responseMsg = 'Cannot locate Order Summary with EOL Number ' + requestData.EOLNumber;
-                       } */ // Removed for DFCT0010455
-        }
 
-        var assetStatus = requestData.Status.toString().toLowerCase();
-
-        var consumable = false;
-        var software = false;
-        var modelGR = new GlideRecord('cmdb_model');
-        modelGR.addQuery('model_number', requestData.ManufacturerPartNumber + "");
-        modelGR.addQuery('manufacturer.name', assetUtil.getManufacturer(requestData.Manufacturer));
-        modelGR.query();
-        if (modelGR.next()) {
-            if (modelGR.sys_class_name == "cmdb_consumable_product_model") {
-                consumable = true;
-            } else if (modelGR.sys_class_name == "cmdb_software_product_model") {
-                software = true;
+            if (missing_fields.length > 0) {
+                responseCode = 400;
+                responseStatus = 'error';
+                responseMsg = 'Required field/s missing: ' + missing_fields.join(', ');
             }
-        } else {
-            responseCode = 400;
-            responseStatus = 'error';
-            responseMsg = 'No model found in ABSPL with a model number of ' + requestData.ManufacturerPartNumber + ' and manufacturer of ' + requestData.Manufacturer;
-        }
 
-        if (responseStatus != 'error') {
-            var assetGR;
-
-            if (requestData.SendingSystem == "CTDI" && requestData.ReferenceNumber) {
-                var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
-                if (taskGR.get('number', requestData.ReferenceNumber)) {
-                    integrationLog.setTableInstance(taskGR.getTableName(), taskGR.getUniqueValue());
-                    taskGR.update();
-                    if (!requestData.SerialNumber || consumable || software) {
-                        assetGR = assetUtil.moveConsumableAssets(requestData.Manufacturer, requestData.ManufacturerPartNumber, taskGR.variables.stockroom_from, taskGR.variables.stockroom_to, requestData.Quantity);
-                        responseCode = 200;
-                        responseStatus = 'success';
-                        responseMsg = 'Successfully updated asset status';
-                    } else {
-                        assetGR = updateAssetStatus(requestData);
-                    }
-                    if (responseCode == 200) {
-                        // Removed during STRY0041418 -- this logic is covered using the parts_recovered API instead. We will update an asset's status here but not the task.
-
-                        /*var parts_moved = JSON.parse(taskGR.variables.parts_moved);
-                        parts_moved.push({
-                            "model": (assetGR.model || modelGR.sys_id || "") + "",
-                            "quantity_picked": requestData.Quantity,
-                            "serial_number": (assetGR.serial_number || "") + "",
-                            "asset_tag": (assetGR.asset_tag || "") + "",
-                            "asset": assetGR.sys_id + "",
-                            "status": "INVT"
-                        });
-                        taskGR.variables.parts_moved = parts_moved;
-                        taskGR.work_notes = "Moved (" + requestData.Quantity + ") " + requestData.ManufacturerPartNumber + " to " + requestData.WarehouseLocation;
-
-                        var allMoved = true;
-                        var parts_to_move = JSON.parse(taskGR.variables.parts_to_move);
-                        for (var p in parts_to_move) {
-                            var num_moved = 0;
-                            for (var m in parts_moved) {
-                                if (parts_moved[m].model == parts_to_move[p].part_number)
-                                    num_moved += parseInt(parts_moved[m].quantity_picked);
-                            }
-                            if (num_moved < parseInt(parts_to_move[p].quantity)) {
-                                allMoved = false;
-                                break;
-                            }
-                        }
-                        if (allMoved) {
-                            taskGR.state = "3"; // Closed Complete
-                            taskGR.work_notes += ' Stockroom move complete -- task closed.';
-                        }
-
-                        taskGR.update();*/
-                    }
-                } else {
-                    responseCode = 400;
-                    responseStatus = 'error';
-                    responseMsg = 'No task found with reference number ' + requestData.ReferenceNumber;
+            if (requestData.SendingSystem != "CTDI") {
+                var orderGR = new GlideRecord('x_att2_abs_procure_abspl_order_summary');
+                if (orderGR.get(requestData.EOLNumber)) {
+                    integrationLog.setTableInstance(orderGR.getTableName(), orderGR.getUniqueValue());
                 }
-            } else if (requestData.SendingSystem == "CTDI") {
-                // no reference number, so just a random move
+                /* else {
+                               responseCode = 400;
+                               responseStatus = 'error';
+                               responseMsg = 'Cannot locate Order Summary with EOL Number ' + requestData.EOLNumber;
+                           } */ // Removed for DFCT0010455
+            }
 
-                if (!requestData.SerialNumber || consumable || software) {
-                    assetUtil.processConsumableAssetUpdate(requestData.Manufacturer, requestData.ManufacturerPartNumber, requestData.WarehouseLocation, requestData.Quantity);
-                    responseCode = 200;
-                    responseStatus = 'success';
-                    responseMsg = 'Successfully updated asset status';
-                } else {
-                    if (ABSPLAssetUtil.HW_ASSET_STATUS_MAP.hasOwnProperty(assetStatus))
-                        updateAssetStatus(requestData);
+            var assetStatus = requestData.Status.toString().toLowerCase();
+
+            var consumable = false;
+            var software = false;
+            var modelGR = new GlideRecord('cmdb_model');
+            modelGR.addQuery('model_number', requestData.ManufacturerPartNumber + "");
+            modelGR.addQuery('manufacturer.name', assetUtil.getManufacturer(requestData.Manufacturer));
+            modelGR.query();
+            if (modelGR.next()) {
+                if (modelGR.sys_class_name == "cmdb_consumable_product_model") {
+                    consumable = true;
+                } else if (modelGR.sys_class_name == "cmdb_software_product_model") {
+                    software = true;
                 }
             } else {
-                if (assetStatus == 'installed') {
-                    // update associated sub line item
-                    var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
-                    subLineGR.addQuery('order_summary_key.eol_number', requestData.EOLNumber);
-                    subLineGR.addQuery('model.model_number', requestData.ManufacturerPartNumber);
-                    if (requestData.LineSysId)
-                        subLineGR.addQuery('order_line_key', requestData.LineSysId);
-                    if (requestData.SerialNumber)
-                        subLineGR.addQuery('serial_number', requestData.SerialNumber);
-                    if (orderGR.staged.toString().toLowerCase() === 'true')
-                        subLineGR.addQuery('state', 'Shipped');
-                    subLineGR.addQuery('state', '!=', 'Installed'); // added so lines with the same model number don't get found repeatedly
-                    subLineGR.query();
-                    if (subLineGR.next()) {
-                        subLineGR.state = 'Installed';
-                        subLineGR.update();
+                responseCode = 400;
+                responseStatus = 'error';
+                responseMsg = 'No model found in ABSPL with a model number of ' + requestData.ManufacturerPartNumber + ' and manufacturer of ' + requestData.Manufacturer;
+            }
 
-                        // asset status should be updated by sub line BR "(ABSPL) Update Asset Status", no need to update here
-                        // updateAssetStatus(requestData);
+            if (responseStatus != 'error') {
+                var assetGR;
 
+                if (requestData.SendingSystem == "CTDI" && requestData.ReferenceNumber) {
+                    var taskGR = new GlideRecord('x_att2_abs_procure_abs_order_task');
+                    if (taskGR.get('number', requestData.ReferenceNumber)) {
+                        integrationLog.setTableInstance(taskGR.getTableName(), taskGR.getUniqueValue());
+                        taskGR.update();
+                        if (!requestData.SerialNumber || consumable || software) {
+                            assetGR = assetUtil.moveConsumableAssets(requestData.Manufacturer, requestData.ManufacturerPartNumber, taskGR.variables.stockroom_from, taskGR.variables.stockroom_to, requestData.Quantity);
+                            responseCode = 200;
+                            responseStatus = 'success';
+                            responseMsg = 'Successfully updated asset status';
+                        } else {
+                            assetGR = updateAssetStatus(requestData);
+                        }
+                        if (responseCode == 200) {
+                            // Removed during STRY0041418 -- this logic is covered using the parts_recovered API instead. We will update an asset's status here but not the task.
+
+                            //RBCTS - 22SEP-25 - Start - Domestic stockroom move
+
+                            var parts_moved = JSON.parse(taskGR.variables.parts_moved);
+                            parts_moved.push({
+                                "model": (assetGR.model || modelGR.sys_id || "") + "",
+                                "quantity_picked": requestData.Quantity,
+                                "serial_number": (assetGR.serial_number || "") + "",
+                                "asset_tag": (assetGR.asset_tag || "") + "",
+                                "asset": assetGR.sys_id + "",
+                                "status": "INVT"
+                            });
+                            taskGR.variables.parts_moved = parts_moved;
+                            taskGR.work_notes = "Moved (" + requestData.Quantity + ") " + requestData.ManufacturerPartNumber + " to " + requestData.WarehouseLocation;
+
+                            var allMoved = true;
+                            var parts_to_move = JSON.parse(taskGR.variables.parts_to_move);
+                            for (var p in parts_to_move) {
+                                var num_moved = 0;
+                                for (var m in parts_moved) {
+                                    if (parts_moved[m].model == parts_to_move[p].part_number)
+                                        num_moved += parseInt(parts_moved[m].quantity_picked);
+                                }
+                                if (num_moved < parseInt(parts_to_move[p].quantity)) {
+                                    allMoved = false;
+                                    break;
+                                }
+                            }
+                            if (allMoved) {
+                                taskGR.state = "3"; // Closed Complete
+                                taskGR.work_notes += ' Stockroom move complete -- task closed.';
+                            }
+
+                            taskGR.update();
+
+                            //RBCTS - 22SEP-25 - End - Domestic stockroom move
+                        }
+                    } else {
+                        responseCode = 400;
+                        responseStatus = 'error';
+                        responseMsg = 'No task found with reference number ' + requestData.ReferenceNumber;
+                    }
+                } else if (requestData.SendingSystem == "CTDI") {
+                    // no reference number, so just a random move
+
+                    if (!requestData.SerialNumber || consumable || software) {
+                        assetUtil.processConsumableAssetUpdate(requestData.Manufacturer, requestData.ManufacturerPartNumber, requestData.WarehouseLocation, requestData.Quantity);
                         responseCode = 200;
                         responseStatus = 'success';
                         responseMsg = 'Successfully updated asset status';
                     } else {
-                        /*** // REMOVED ERROR PER DFCT0010552
+                        if (ABSPLAssetUtil.HW_ASSET_STATUS_MAP.hasOwnProperty(assetStatus))
+                            updateAssetStatus(requestData);
+                    }
+                } else {
+                    if (assetStatus == 'installed' || assetStatus == 'migrated' || assetStatus == 'spare' || assetStatus == 'missing' || assetStatus == 'lost') {
+                        // update associated sub line item
+                        var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
+                        subLineGR.addQuery('order_summary_key.eol_number', requestData.EOLNumber);
+                        subLineGR.addQuery('model.model_number', requestData.ManufacturerPartNumber);
+                        if (requestData.LineSysId)
+                            subLineGR.addQuery('order_line_key', requestData.LineSysId);
+                        if (requestData.SerialNumber)
+                            subLineGR.addQuery('serial_number', requestData.SerialNumber);
+                        if (orderGR.staged.toString().toLowerCase() === 'true')
+                            subLineGR.addQuery('state', 'Shipped');
+                        subLineGR.addQuery('state', '!=', 'Installed'); // added so lines with the same model number don't get found repeatedly
+                        subLineGR.query();
+                        if (subLineGR.next()) {
+                            subLineGR.state = 'Installed';
+                            subLineGR.ttu_status = assetStatus;
+                            subLineGR.update();
+
+                            // asset status should be updated by sub line BR "(ABSPL) Update Asset Status", no need to update here
+                            // updateAssetStatus(requestData);
+
+                            responseCode = 200;
+                            responseStatus = 'success';
+                            responseMsg = 'Successfully updated asset status';
+                        } else {
+                            /*** // REMOVED ERROR PER DFCT0010552
                         responseCode = 400;
                         responseStatus = 'error';
                         responseMsg = 'No sub line found with matching model number and pending installation for EOL ' + requestData.EOLNumber;
 						***/
 
-                        if (consumable || software) {
-                            // no need to update consumables and software here, accept update but don't change anything
+                            if (consumable || software) {
+                                // no need to update consumables and software here, accept update but don't change anything
+                                responseCode = 200;
+                                responseStatus = 'success';
+                                responseMsg = 'Asset status accepted';
+                            } else {
+                                updateAssetStatus(requestData);
+                            }
+                        }
+                    } else {
+                        if (ABSPLAssetUtil.HW_ASSET_STATUS_MAP.hasOwnProperty(assetStatus)) {
                             responseCode = 200;
                             responseStatus = 'success';
                             responseMsg = 'Asset status accepted';
-                        } else {
-                            updateAssetStatus(requestData);
-                        }
-                    }
-                } else {
-                    if (ABSPLAssetUtil.HW_ASSET_STATUS_MAP.hasOwnProperty(assetStatus)) {
-                        responseCode = 200;
-                        responseStatus = 'success';
-                        responseMsg = 'Asset status accepted';
-                        /* Commented out in response to an issue where asset statuses were being improperly set by upstream systems
+
+                            if (requestData.SendingSystem == "GPS" && requestData.SerialNumber && assetStatus.contains('retired')) {
+
+                                var partName = requestData.ManufacturerPartNumber;
+                                var serialNumber = requestData.SerialNumber;
+
+                                var assetRec = new GlideRecord('alm_asset');
+                                assetRec.addQuery('model.model_number=' + partName + '^serial_number=' + serialNumber);
+                                assetRec.query();
+                                if (assetRec.next()) {
+                                    assetUtil.setHWAssetStatusFromMap(assetRec, assetStatus, true);
+                                    responseMsg = 'Successfully updated asset status';
+                                } else {
+                                    responseMsg = 'Asset not in SNC Inventory';
+                                }
+                            }
+
+                            /* Commented out in response to an issue where asset statuses were being improperly set by upstream systems
                         if (consumable || software) {
                             // no need to update consumables and software here, accept update but don't change anything
                             responseCode = 200;
@@ -1134,21 +1179,26 @@ ABSPLEquipmentOrderRest.prototype = {
                             updateAssetStatus(requestData);
                         }
 						*/
-                    } else {
-                        // Invalid status provided
-                        responseCode = 400;
-                        responseStatus = 'error';
-                        responseMsg = 'Invalid status provided: ' + requestData.Status;
+                        } else {
+                            // Invalid status provided
+                            responseCode = 400;
+                            responseStatus = 'error';
+                            responseMsg = 'Invalid status provided: ' + requestData.Status;
+                        }
                     }
                 }
             }
-        }
 
-        if (requestData.SendingSystem == "CTDI" && responseStatus != 'success') {
-            commUtil.createOrderTask(null, 'Integration Error', 'Error on asset update from CTDI', responseMsg + '\n\n' + JSON.stringify(requestData), '3df59c34eb5156901c75fd77cad0cd5d' /* ABSPL Admin */ );
-            responseCode = "200";
-            responseStatus = "success";
-            responseMsg = "Warning: " + responseMsg;
+            if (requestData.SendingSystem == "CTDI" && responseStatus != 'success') {
+                commUtil.createOrderTask(null, 'Integration Error', 'Error on asset update from CTDI', responseMsg + '\n\n' + JSON.stringify(requestData), '3df59c34eb5156901c75fd77cad0cd5d' /* ABSPL Admin */ );
+                responseCode = "200";
+                responseStatus = "success";
+                responseMsg = "Warning: " + responseMsg;
+            }
+        } catch (e) {
+            responseCode = 500;
+            responseStatus = 'Error';
+            responseMsg = 'ABSPL server error: ' + e.message + (e.stack ? e.stack : '');
         }
 
         // Set Response body
@@ -1172,10 +1222,11 @@ ABSPLEquipmentOrderRest.prototype = {
         function updateAssetStatus(data) {
             var stockroom = data.WarehouseLocation ? data.WarehouseLocation + "" : "";
             var assetGR;
+			var warnings = [];
 
             try {
                 if (data.OldSerialNumber && data.OldSerialNumber != data.SerialNumber && data.Status.toString().toLowerCase().indexOf('replace') < 0)
-                    assetGR = assetUtil.getHWAssetGRFromSN(data.ManufacturerPartNumber, data.Manufacturer, data.OldSerialNumber, false);
+                    assetGR = assetUtil.getHWAssetGRFromSN(null/*model sys_id*/, data.ManufacturerPartNumber, data.Manufacturer, data.OldSerialNumber, data.AssetTag, false);
 
                 if (assetGR && assetGR.isValidRecord()) {
                     var subLineGR = new GlideRecord('x_att2_abs_procure_abspl_order_sub_line_item');
@@ -1185,7 +1236,7 @@ ABSPLEquipmentOrderRest.prototype = {
                     subLineGR.setValue('serial_number', data.SerialNumber);
                     subLineGR.updateMultiple();
                 } else {
-                    assetGR = assetUtil.getHWAssetGRFromSN(data.ManufacturerPartNumber, data.Manufacturer, data.SerialNumber, true);
+                    assetGR = assetUtil.getHWAssetGRFromSN(null/*model sys_id*/, data.ManufacturerPartNumber, data.Manufacturer, data.SerialNumber, data.AssetTag, true);
                 }
 
                 if (assetGR && assetGR.isValidRecord()) {
@@ -1195,19 +1246,27 @@ ABSPLEquipmentOrderRest.prototype = {
                         if (stockGR.get('name', stockroom)) {
                             assetGR.stockroom = stockGR.sys_id + "";
                         } else {
-                            throw new Error('WarehouseLocation ' + stockroom + ' was not found');
+                            assetGR.stockroom = ""; //throw new Error('WarehouseLocation ' + stockroom + ' was not found');
+							warnings.push(stockroom + ' invalid or not found');
                         }
                     }
                     if (data.SendingSystem == "CTDI") {
                         if (data.AssetTag)
                             assetGR.asset_tag = data.AssetTag;
+						else
+							warnings.push('No asset tag provided');
+
                         if (data.SerialNumber)
                             assetGR.serial_number = data.SerialNumber;
+						else
+							warnings.push('No serial number provided');
                     }
                     if (assetUtil.setHWAssetStatusFromMap(assetGR, data.Status)) {
                         responseCode = 200;
                         responseStatus = 'success';
                         responseMsg = 'Successfully updated asset status';
+						if (warnings.length > 0)
+							responseMsg += ('--WARNING: ' + warnings.join('|'));
                     } else {
                         throw new Error('Internal server error: unable to update asset status', {
                             code: 500
@@ -1470,8 +1529,12 @@ ABSPLEquipmentOrderRest.prototype = {
             for (var t in requestData.tables) {
                 var table = requestData.tables[t].name;
                 if (!(table && table.startsWith('x_att2_abs_procure'))) {
-                    LOG.push("Warning: invalid table name ('" + table + "') at index " + t + ", skipping load for this table");
-                    continue;
+                    LOG.push("Warning: non-ABSPL table name ('" + table + "') at index " + t);
+
+                    if (table && table.startsWith('x_abs_load_'))
+                        table = table.replace('x_abs_load_', '');
+                    else
+                        continue;
                 }
 
                 var records = requestData.tables[t].records;
